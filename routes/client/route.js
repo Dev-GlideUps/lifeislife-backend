@@ -1,0 +1,92 @@
+//express
+const express = require("express");
+const route = express.Router();
+
+//validate user's access token
+const validateUserToken = require("../../middleware/validateUserToken.middleware");
+
+//require client's route.js
+const user = require("./user.route");
+const profileVisitor = require("./profileVisitor.route");
+const followerFollowing = require("./followerFollowing.route");
+const hashTag = require("./hashTag.route");
+const song = require("./song.route");
+const report = require("./report.route");
+const reportReason = require("./reportReason.route");
+const post = require("./post.route");
+const video = require("./video.route");
+const likeHistory = require("./likeHistory.route");
+const comment = require("./comment.route");
+const coinPlan = require("./coinPlan.route");
+const giftCategory = require("./giftCategory.route");
+const gift = require("./gift.route");
+const reaction = require("./reaction.route");
+const help = require("./help.route");
+const setting = require("./setting.route");
+const watchHistory = require("./watchHistory.route");
+const theme = require("./theme.route");
+const avtarFrame = require("./avtarFrame.route");
+const purchasedItem = require("./purchasedItem.route");
+const chatTopic = require("./chatTopic.route");
+const chat = require("./chat.route");
+const history = require("./history.route");
+const liveStreamer = require("./liveStreamer.route");
+const wealthLevel = require("./wealthLevel.route");
+const referralSystem = require("./referralSystem.route");
+const referral = require("./referral.route");
+const hostApplication = require("./hostApplication.route");
+const payoutMethod = require("./payoutMethod.route");
+const coinTrader = require("./coinTrader.route");
+const coinTraderHistory = require("./coinTraderHistory.route");
+const payoutRequest = require("./payoutRequest.route");
+const block = require("./block.route");
+const banner = require("./banner.route");
+const verification = require("./verification.route");
+const songCategory = require("./songCategory.route");
+const beautyEffect = require("./beautyEffect.route");
+const announcement = require("./announcement.route");
+const gameInfo = require("./gameInfo.route");
+
+//exports client's route.js
+route.use("/user", user);
+route.use("/profileVisitor", validateUserToken, profileVisitor);
+route.use("/hashTag", validateUserToken, hashTag);
+route.use("/song", validateUserToken, song);
+route.use("/report", validateUserToken, report);
+route.use("/reportReason", validateUserToken, reportReason);
+route.use("/post", validateUserToken, post);
+route.use("/video", validateUserToken, video);
+route.use("/likeHistory", validateUserToken, likeHistory);
+route.use("/comment", validateUserToken, comment);
+route.use("/coinPlan", validateUserToken, coinPlan);
+route.use("/gift", validateUserToken, gift);
+route.use("/help", validateUserToken, help);
+route.use("/watchHistory", validateUserToken, watchHistory);
+route.use("/theme", validateUserToken, theme);
+route.use("/avtarFrame", validateUserToken, avtarFrame);
+route.use("/chatTopic", validateUserToken, chatTopic);
+route.use("/chat", validateUserToken, chat);
+route.use("/purchasedItem", validateUserToken, purchasedItem);
+route.use("/referral", validateUserToken, referral);
+route.use("/block", validateUserToken, block);
+route.use("/payoutRequest", validateUserToken, payoutRequest);
+route.use("/verification", validateUserToken, verification);
+route.use("/setting", setting);
+route.use("/referralSystem", referralSystem);
+route.use("/followerFollowing", followerFollowing);
+route.use("/giftCategory", giftCategory);
+route.use("/reaction", reaction);
+route.use("/history", history);
+route.use("/liveStreamer", liveStreamer);
+route.use("/wealthLevel", wealthLevel);
+route.use("/hostApplication", hostApplication);
+route.use("/payoutMethod", payoutMethod);
+route.use("/coinTrader", coinTrader);
+route.use("/coinTraderHistory", coinTraderHistory);
+route.use("/banner", banner);
+route.use("/songCategory", songCategory);
+route.use("/beautyEffect", beautyEffect);
+route.use("/announcement", validateUserToken, announcement);
+route.use("/gameInfo", gameInfo);
+
+module.exports = route;

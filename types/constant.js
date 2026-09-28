@@ -1,0 +1,145 @@
+exports.LOGIN_TYPE = {
+  MOBILENO: 1,
+  GOOGLE: 2,
+  QUICK: 3,
+  EMAIL_PASSWORD: 4,
+  APPLE: 5,
+  FACEBOOK: 6,
+};
+
+exports.IMAGE_TYPE = {
+  IMAGE: 1,
+  GIF: 2,
+  SVGA: 3,
+};
+
+exports.IMAGE_VIDEO_TYPE = {
+  LINK: 1,
+  FILE: 2,
+};
+
+exports.GIFT_TYPE = {
+  IMAGE: 1,
+  GIF: 2,
+  SVGA: 3,
+};
+
+exports.HISTORY_TYPE = {
+  LOGINBONUS: 1,
+  PURCHASE_THEME: 2,
+  PURCHASE_AVTARFRAME: 3,
+  PURCHASE_RIDE: 4,
+  PRIVATE_VIDEO_CALL: 5,
+  LIVE_GIFT: 6,
+  COIN_PLAN_PURCHASE: 7,
+  WITHDRAWAL: 8,
+  AGENCY_EARN_COMMISSION: 9,
+  REFERRAL_REWARD: 10,
+  COIN_PURCHASE_FROM_COINTRADER: 11,
+  TEENPATTI_GAME: 12,
+  FERRYWHEEL_GAME: 13,
+  CASINO_GAME: 14,
+  LUCKY_GIFT_WIN_BY_SENDER: 15,
+  PRIVATE_AUDIO_CALL: 16,
+  ADMIN_ADDED_COIN: 17,
+  ADMIN_DEDUCTED_COIN: 18,
+  THIRD_PARTY_GAME: 19,
+  CHAT_GIFT: 25,
+  ADMIN_AGENCY_ADDED_EARNING: 30,
+  ADMIN_AGENCY_DEDUCTED_EARNING: 31,
+};
+
+exports.STATUS_OF_HELP = {
+  PENDING: 1,
+  SOLVED: 2,
+};
+
+exports.MESSAGE_TYPE = {
+  TEXT: 1,
+  IMAGE: 2,
+  VIDEO_CALL: 3,
+  AUDIO: 4,
+  AUDIO_CALL: 5,
+  CHAT_GIFT: 6,
+};
+
+exports.CALL_TYPE = {
+  DEFAULT: 0,
+  RECEIVED: 1,
+  DECLINED: 2,
+  MISCALLED: 3,
+};
+
+exports.WITHDRAWAL_PERSON = {
+  AGENCY: 1,
+  HOST: 2,
+  USER: 3,
+};
+
+exports.WITHDRAWAL_STATUS = {
+  DEFAULT: 0,
+  PENDING: 1,
+  ACCEPTED: 2,
+  DECLINED: 3,
+};
+
+exports.TYPE_OF_REPORT = {
+  VIDEO: 1,
+  POST: 2,
+  USERTOUSER: 3,
+};
+
+exports.STATUS_OF_REPORT = {
+  PENDING: 1,
+  SOLVED: 2,
+};
+
+exports.VALIDITY_TYPE = {
+  DAY: 1,
+  MONTH: 2,
+  YEAR: 3,
+};
+
+exports.ITEM_TYPE = {
+  THEME: 1,
+  AVTARFRAME: 2,
+  RIDE: 3,
+};
+
+exports.RIDE_TYPE = {
+  IMAGE: 1,
+  GIF: 2,
+  SVGA: 3,
+};
+
+exports.AVTAR_FRAME_TYPE = {
+  IMAGE: 1,
+  GIF: 2,
+  SVGA: 3,
+};
+
+exports.ROLE_TYPE = {
+  USER: 1,
+  HOST: 2,
+  AGENCY: 3,
+  COINTRADER: 4,
+};
+
+exports.HOST_APPLICATION_TYPE = {
+  PENDING: 1,
+  APPROVED: 2,
+  REJECTED: 3,
+};
+
+exports.BANNER_TYPE = {
+  GIFT: 1,
+  SPLASH: 2,
+  HOME: 3,
+  GAME: 4,
+};
+
+exports.VERIFICATION_STATUS = {
+  PENDING: 1,
+  ACCEPTED: 2,
+  DECLINED: 3,
+};

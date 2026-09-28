@@ -1,0 +1,123 @@
+const _0x5a01e5 = _0x4c99;
+function _0x2b9f() {
+  const _0x3c369e = [
+    "ord",
+    "ddleware",
+    "sword",
+    "22079134BGLKdZ",
+    "changePass",
+    "../../midd",
+    "image",
+    "min",
+    "ifyAdminAu",
+    "../../cont",
+    "checkAdmin",
+    "ofile",
+    "inEmailCon",
+    "nRegistrat",
+    "min/admin.",
+    "Router",
+    "/checkAdmi",
+    "3540761umIoTR",
+    "/multer",
+    "/resetPass",
+    "/getAdminP",
+    "6LlKzHr",
+    "8163378Kpiwww",
+    "/changePas",
+    "1526050qnXqaX",
+    "10IzKCgd",
+    "processAdm",
+    "minEmailCo",
+    "rollers/ad",
+    "single",
+    "Registrati",
+    "updateAdmi",
+    "post",
+    "4kWpLbo",
+    "nProfile",
+    "controller",
+    "exports",
+    "3416472KrOeQN",
+    "firmation",
+    "multer",
+    "1574106kPjaWZ",
+    "../../chec",
+    "resetPassw",
+    "patch",
+    "thToken.mi",
+    "ion",
+    "registerAd",
+    "dmin",
+    "kAccess",
+    "get",
+    "rofile",
+    "../../util",
+    "getAdminPr",
+    "express",
+    "inProfile",
+    "/registerA",
+    "/updateAdm",
+    "adminLogin",
+    "21074gRVKEw",
+    "leware/ver",
+    "/processAd",
+    "nfirmation",
+    "119LZiPto",
+    "/adminLogi",
+    "word",
+  ];
+  _0x2b9f = function () {
+    return _0x3c369e;
+  };
+  return _0x2b9f();
+}
+function _0x4c99(_0x37e38b, _0x121e67) {
+  _0x37e38b = _0x37e38b - (-0x4c0 + 0x1 * 0x2573 + -0x2028);
+  const _0x44b269 = _0x2b9f();
+  let _0x198240 = _0x44b269[_0x37e38b];
+  return _0x198240;
+}
+(function (_0x212590, _0x15212b) {
+  const _0xe5d9c6 = _0x4c99,
+    _0x27c315 = _0x212590();
+  while (!![]) {
+    try {
+      const _0x50f238 =
+        (-parseInt(_0xe5d9c6(0x98)) / (-0x1ecd * -0x1 + 0x56 * 0x1b + -0x237 * 0x12)) * (parseInt(_0xe5d9c6(0x94)) / (-0x52f + -0x6 * 0x5b8 + 0x2781)) +
+        (parseInt(_0xe5d9c6(0xc3)) / (0x2301 + -0x530 * 0x1 + -0x1dce)) * (-parseInt(_0xe5d9c6(0xbc)) / (0x25c9 * -0x1 + -0x724 + 0x2cf1)) +
+        -parseInt(_0xe5d9c6(0xb3)) / (-0x1 * -0x531 + 0x77 * -0x3e + 0x17a6) +
+        (-parseInt(_0xe5d9c6(0xb0)) / (0x1d05 + 0x1 * 0x47f + -0x217e)) * (-parseInt(_0xe5d9c6(0xac)) / (0xf48 + 0x9a3 * -0x2 + 0x405)) +
+        -parseInt(_0xe5d9c6(0xc0)) / (0x2369 + 0xe * -0x194 + -0xd49) +
+        (-parseInt(_0xe5d9c6(0xb1)) / (-0x3bb * -0x4 + 0x16d * -0x2 + -0xc09)) * (-parseInt(_0xe5d9c6(0xb4)) / (0xf93 + -0x278 * 0xf + -0x1 * -0x157f)) +
+        parseInt(_0xe5d9c6(0x9e)) / (-0x6d9 + 0x1 * 0x1513 + -0xe2f);
+      if (_0x50f238 === _0x15212b) break;
+      else _0x27c315["push"](_0x27c315["shift"]());
+    } catch (_0x30d0ea) {
+      _0x27c315["push"](_0x27c315["shift"]());
+    }
+  }
+})(_0x2b9f, -0xb9046 + -0xb20ef + 0x2490b6);
+const express = require(_0x5a01e5(0x8f)),
+  route = express[_0x5a01e5(0xaa)](),
+  checkAccessWithSecretKey = require(_0x5a01e5(0xc4) + _0x5a01e5(0xcb)),
+  AdminController = require(_0x5a01e5(0xa4) + _0x5a01e5(0xb7) + _0x5a01e5(0xa9) + _0x5a01e5(0xbe)),
+  multer = require(_0x5a01e5(0xc2)),
+  storage = require(_0x5a01e5(0x8d) + _0x5a01e5(0xad)),
+  upload = multer({ storage: storage }),
+  verifyAdminAuthToken = require(_0x5a01e5(0xa0) + _0x5a01e5(0x95) + _0x5a01e5(0xa3) + _0x5a01e5(0xc7) + _0x5a01e5(0x9c));
+(route[_0x5a01e5(0x8b)](_0x5a01e5(0xab) + _0x5a01e5(0xa8) + _0x5a01e5(0xc8), checkAccessWithSecretKey(), AdminController[_0x5a01e5(0xa5) + _0x5a01e5(0xb9) + "on"]),
+  route[_0x5a01e5(0xbb)](_0x5a01e5(0x91) + _0x5a01e5(0xca), checkAccessWithSecretKey(), AdminController[_0x5a01e5(0xc9) + _0x5a01e5(0xa2)]),
+  route[_0x5a01e5(0xbb)](_0x5a01e5(0x99) + "n", verifyAdminAuthToken, checkAccessWithSecretKey(), AdminController[_0x5a01e5(0x93)]),
+  route[_0x5a01e5(0xc6)](
+    _0x5a01e5(0x92) + _0x5a01e5(0x90),
+    verifyAdminAuthToken,
+    checkAccessWithSecretKey(),
+    upload[_0x5a01e5(0xb8)](_0x5a01e5(0xa1)),
+    AdminController[_0x5a01e5(0xba) + _0x5a01e5(0xbd)],
+  ),
+  route[_0x5a01e5(0x8b)](_0x5a01e5(0xaf) + _0x5a01e5(0x8c), verifyAdminAuthToken, checkAccessWithSecretKey(), AdminController[_0x5a01e5(0x8e) + _0x5a01e5(0xa6)]),
+  route[_0x5a01e5(0xc6)](_0x5a01e5(0xb2) + _0x5a01e5(0x9d), verifyAdminAuthToken, checkAccessWithSecretKey(), AdminController[_0x5a01e5(0x9f) + _0x5a01e5(0x9a)]),
+  route[_0x5a01e5(0xc6)](_0x5a01e5(0xae) + _0x5a01e5(0x9a), verifyAdminAuthToken, checkAccessWithSecretKey(), AdminController[_0x5a01e5(0xc5) + _0x5a01e5(0x9b)]),
+  route[_0x5a01e5(0x8b)](_0x5a01e5(0x96) + _0x5a01e5(0xb6) + _0x5a01e5(0x97), checkAccessWithSecretKey(), AdminController[_0x5a01e5(0xb5) + _0x5a01e5(0xa7) + _0x5a01e5(0xc1)]),
+  (module[_0x5a01e5(0xbf)] = route));
