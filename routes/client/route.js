@@ -46,6 +46,9 @@ const songCategory = require("./songCategory.route");
 const beautyEffect = require("./beautyEffect.route");
 const announcement = require("./announcement.route");
 const gameInfo = require("./gameInfo.route");
+const tencent = require("./tencent.route");
+const testAuth = require("./testAuth.route");
+const testSocket = require("./test.route");
 
 //exports client's route.js
 route.use("/user", user);
@@ -88,5 +91,8 @@ route.use("/songCategory", songCategory);
 route.use("/beautyEffect", beautyEffect);
 route.use("/announcement", validateUserToken, announcement);
 route.use("/gameInfo", gameInfo);
+route.use("/live", tencent);
+route.use("/test", testAuth);
+route.use("/test", testSocket); // Socket test routes (no auth required)
 
 module.exports = route;

@@ -10,6 +10,7 @@ const Comment = require("../../models/comment.model");
 const Report = require("../../models/report.model");
 const Notification = require("../../models/notification.model");
 const WatchHistory = require("../../models/watchHistory.model");
+const Block = require("../../models/block.model");
 
 //deleteFiles
 const { deleteFiles, deleteFile } = require("../../util/deletefile");
@@ -444,6 +445,12 @@ exports.userVideoLibrary = async (req, res) => {
 
     const loggedInUserObjectId = new mongoose.Types.ObjectId(loggedInUserId);
     const toUserObjectId = new mongoose.Types.ObjectId(toUserId);
+
+    // Check if target user has blocked the requesting user
+    const isBlockedByTarget = await Block.exists({ userId: toUserObjectId, toUserId: loggedInUserObjectId });
+    if (isBlockedByTarget) {
+      return res.status(200).json({ status: false, message: "You cannot view this content.", isBlocked: true });
+    }
 
     const [user, videos] = await Promise.all([
       User.findById(toUserObjectId).select("_id isBlock").lean(),

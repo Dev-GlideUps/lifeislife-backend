@@ -13,6 +13,10 @@ const liveStreamerSchema = new mongoose.Schema(
     agoraUid: { type: Number, default: 0 },
     channel: { type: String, default: "" },
     token: { type: String, default: "" },
+
+    // Tencent TRTC fields
+    tencentUserId: { type: String, default: "" },
+    tencentRoomId: { type: String, default: "" },
     earnedCoins: { type: Number, default: 0 }, //room coin earned during live
     hostCoins: { type: Number, default: 0 }, //coin earned during live
 
@@ -31,6 +35,8 @@ const liveStreamerSchema = new mongoose.Schema(
       host1LiveId: { type: String, default: "" },
       host1Channel: { type: String, default: "" },
       host1AgoraUID: { type: Number, default: 0 },
+      host1TencentUserId: { type: String, default: "" }, // Tencent TRTC
+      host1TencentRoomId: { type: String, default: "" }, // Tencent TRTC
 
       host2Id: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }, //user who joined in Pk
       host2Name: { type: String, default: "" },
@@ -41,6 +47,8 @@ const liveStreamerSchema = new mongoose.Schema(
       host2LiveId: { type: String, default: "" },
       host2Channel: { type: String, default: "" },
       host2AgoraUID: { type: Number, default: 0 },
+      host2TencentUserId: { type: String, default: "" }, // Tencent TRTC
+      host2TencentRoomId: { type: String, default: "" }, // Tencent TRTC
 
       localRank: { type: Number, default: 0 },
       localGiftCount: { type: Number, default: 0 },
@@ -98,6 +106,19 @@ const liveStreamerSchema = new mongoose.Schema(
         blockedUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
       },
     ],
+    // Kicked users for this live session only (not permanent like blockedUsers)
+    // Cleared when live session ends, users can join new sessions by same host
+    kickedUsers: [
+      {
+        kickedUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+        kickedAt: { type: Date, default: Date.now },
+      },
+    ],
+    mutedUsers: [
+      {
+        mutedUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+      },
+    ],
     admins: [
       {
         adminUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
@@ -128,6 +149,7 @@ const liveStreamerSchema = new mongoose.Schema(
           mute: { type: Number, enum: [0, 1, 2, 3], default: 0 }, //1.mute 2.unMute 3.muteByHostToUser
           lock: { type: Boolean, default: false },
           agoraUid: { type: Number, default: 0 },
+          tencentUserId: { type: String, default: "" }, // Tencent TRTC user ID
         },
       ],
       default: seat.default,
@@ -135,6 +157,7 @@ const liveStreamerSchema = new mongoose.Schema(
 
     isHostCameraEnabled: { type: Boolean, default: true },
     isHostMuteEnabled: { type: Boolean, default: true },
+    isHostOnBreak: { type: Boolean, default: false },
     requested: {
       type: [
         {
@@ -152,6 +175,7 @@ const liveStreamerSchema = new mongoose.Schema(
           uniqueId: { type: String, default: "" },
           isVerified: { type: Boolean, default: false },
           agoraUid: { type: String, default: "" },
+          tencentUserId: { type: String, default: "" }, // Tencent TRTC user ID
           isMute: { type: Number, enum: [0, 1, 2, 3], default: 0 }, //1.mute 2.unMute 3.muteByHostToUser
           isRequested: { type: Boolean, default: false },
           isAccepted: { type: Boolean, default: false },

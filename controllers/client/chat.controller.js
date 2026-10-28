@@ -3,6 +3,7 @@ const Chat = require("../../models/chat.model");
 //import models
 const ChatTopic = require("../../models/chatTopic.model");
 const User = require("../../models/user.model");
+const Block = require("../../models/block.model");
 
 //private key
 const admin = require("../../util/privateKey");
@@ -64,6 +65,20 @@ exports.sendChatMessage = async (req, res) => {
     if (!senderUser || !receiverUser) {
       if (chatFiles) deleteFiles(chatFiles);
       return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    // Check if receiver has blocked the sender (blockedBy = true means someone blocked me)
+    const blockedByReceiver = await Block.exists({ userId: receiverObjId, toUserId: senderObjId });
+    if (blockedByReceiver) {
+      if (chatFiles) deleteFiles(chatFiles);
+      return res.status(200).json({ status: false, message: "You cannot send messages to this user.", isBlocked: false, blockedBy: true });
+    }
+
+    // Check if sender has blocked the receiver (isBlocked = true means I blocked someone)
+    const iBlockedReceiver = await Block.exists({ userId: senderObjId, toUserId: receiverObjId });
+    if (iBlockedReceiver) {
+      if (chatFiles) deleteFiles(chatFiles);
+      return res.status(200).json({ status: false, message: "You have blocked this user. Unblock to send messages.", isBlocked: true, blockedBy: false });
     }
 
     let chatTopicId = chatTopic?._id;
@@ -247,6 +262,15 @@ exports.fetchChatHistory = async (req, res) => {
       return res.status(200).json({ status: false, message: "User not found." });
     }
 
+    // Check block status between users
+    const [blockedByReceiver, iBlockedReceiver] = await Promise.all([
+      Block.exists({ userId: receiverObjId, toUserId: senderObjId }), // receiver blocked me
+      Block.exists({ userId: senderObjId, toUserId: receiverObjId }), // I blocked receiver
+    ]);
+
+    const isBlocked = !!iBlockedReceiver;  // I blocked someone
+    const blockedBy = !!blockedByReceiver; // Someone blocked me
+
     if (!chatTopic) {
       const newChatTopic = new ChatTopic({ senderId: senderObjId, receiverId: receiverObjId });
       await newChatTopic.save();
@@ -257,6 +281,8 @@ exports.fetchChatHistory = async (req, res) => {
         chatTopic: newChatTopic._id,
         chat: [],
         receiver: receiverUser,
+        isBlocked,
+        blockedBy,
       });
     }
 
@@ -275,6 +301,8 @@ exports.fetchChatHistory = async (req, res) => {
       chatTopic: chatTopic._id,
       chat: chatHistory,
       receiver: receiverUser,
+      isBlocked,
+      blockedBy,
     });
   } catch (error) {
     console.error("Error:", error);

@@ -9,6 +9,7 @@ const historySchema = new mongoose.Schema(
 
     //for type 1,2,3,4,7,8,9,10,11,12,13,14,15,16,17,18,19,26,27,28,29,30,31
     coin: { type: Number, default: 0 },
+    coinType: { type: Number, default: 1 }, // 1 = Gold, 2 = Silver
 
     //for type 5,6,25
     senderCoin: { type: Number, default: 0 }, //coin deducted from sender

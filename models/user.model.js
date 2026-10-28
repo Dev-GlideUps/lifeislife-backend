@@ -10,6 +10,7 @@ const userSchema = new mongoose.Schema(
     bio: { type: String, default: "" },
     age: { type: Number, default: 18 },
     image: { type: String, default: "" },
+    coverImage: { type: String, default: "" },
     isProfilePicBanned: { type: Boolean, default: false },
     email: { type: String, default: "" },
     mobileNumber: { type: String, default: "" },
@@ -27,7 +28,8 @@ const userSchema = new mongoose.Schema(
     firebaseUid: { type: String, default: "" }, //firebase uid
     provider: { type: String, default: "" },
 
-    coin: { type: Number, default: 0 },
+    coin: { type: Number, default: 0 }, // Gold - for spending only
+    silverCoin: { type: Number, default: 0 }, // Silver - earned from gifts/calls, for withdrawal
     loginRewardCoins: { type: Number, default: 0 },
     topUpCoins: { type: Number, default: 0 }, //totalTopUp (Total coins the user has topped up)
     receivedCoins: { type: Number, default: 0 }, //call + gift + referral bonus

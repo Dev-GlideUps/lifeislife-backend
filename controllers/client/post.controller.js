@@ -8,6 +8,7 @@ const HashTag = require("../../models/hashTag.model");
 const HashTagUsageHistory = require("../../models/hashTagUsageHistory.model");
 const Report = require("../../models/report.model");
 const Notification = require("../../models/notification.model");
+const Block = require("../../models/block.model");
 
 //deleteFiles
 const { deleteFile, deleteFiles } = require("../../util/deletefile");
@@ -343,6 +344,12 @@ exports.getUserPosts = async (req, res) => {
 
     const userId = new mongoose.Types.ObjectId(req.user.userId); // Logged-in userId
     const userIdOfPost = new mongoose.Types.ObjectId(req.query.toUserId); // userId of the post owner
+
+    // Check if target user has blocked the requesting user
+    const isBlockedByTarget = await Block.exists({ userId: userIdOfPost, toUserId: userId });
+    if (isBlockedByTarget) {
+      return res.status(200).json({ status: false, message: "You cannot view this content.", isBlocked: true });
+    }
 
     const posts = await Post.aggregate([
       {

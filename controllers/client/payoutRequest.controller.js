@@ -33,14 +33,16 @@ exports.submitPayoutRequest = async (req, res) => {
     const objectId = new mongoose.Types.ObjectId(req.user.userId);
     const formattedGateway = paymentGateway.trim();
     const requestedCoins = Number(coin);
-    const requestAmount = parseFloat(requestedCoins / settingJSON.minCoinsToCashOut).toFixed(2);
+    // Use silverToCashOutRate for silver to money conversion
+    const silverRate = settingJSON.silverToCashOutRate || settingJSON.minCoinsToCashOut || 1000;
+    const requestAmount = parseFloat(requestedCoins / silverRate).toFixed(2);
 
     if (isNaN(requestedCoins) || requestedCoins <= 0) {
       return res.status(200).json({ status: false, message: "Please enter a valid coin amount." });
     }
 
     const [user, uniqueId] = await Promise.all([
-      User.findOne({ _id: objectId }).select("_id coin loginRewardCoins role fcmToken isPushNotificationEnabled").lean(),
+      User.findOne({ _id: objectId }).select("_id silverCoin role fcmToken isPushNotificationEnabled").lean(),
       generateHistoryUniqueId(),
     ]);
 
@@ -57,26 +59,17 @@ exports.submitPayoutRequest = async (req, res) => {
       return res.status(200).json({ status: false, message: "Invalid user role." });
     }
 
-    // if (requestedCoins > user.coin) {
-    //   return res.status(200).json({ status: false, message: "Insufficient balance." });
-    // }
+    // Withdraw from silverCoin (earnings) only
+    const silverBalance = Number(user.silverCoin || 0);
 
-    const totalCoins = Number(user.coin || 0);
-    const loginRewardCoins = Number(user.loginRewardCoins || 0);
-    const withdrawableCoins = totalCoins - loginRewardCoins; // only non-login-reward coins are withdrawable
-
-    if (requestedCoins > withdrawableCoins) {
-      if (requestedCoins <= totalCoins && loginRewardCoins > 0) {
-        console.log("Login bonus coins cannot be withdrawn. Only earned coins are eligible for payout.");
-        return res.status(200).json({ status: false, message: "Login bonus coins cannot be withdrawn. Only earned coins are eligible for payout." });
-      }
-
-      console.log("Insufficient balance.");
-      return res.status(200).json({ status: false, message: "Insufficient balance." });
+    if (requestedCoins > silverBalance) {
+      console.log("Insufficient silver balance.");
+      return res.status(200).json({ status: false, message: "Insufficient silver balance." });
     }
 
-    if (requestedCoins < settingJSON.minCoinsForPayout) {
-      return res.status(200).json({ status: false, message: `Minimum withdrawal is ${settingJSON.minCoinsForPayout} coins.` });
+    const minSilverPayout = settingJSON.minSilverForPayout || settingJSON.minCoinsForPayout || 0;
+    if (requestedCoins < minSilverPayout) {
+      return res.status(200).json({ status: false, message: `Minimum withdrawal is ${minSilverPayout} silver coins.` });
     }
 
     let pendingFilter = { person, status: 1, userId: objectId };

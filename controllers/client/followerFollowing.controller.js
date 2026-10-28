@@ -5,6 +5,8 @@ const mongoose = require("mongoose");
 
 //import model
 const User = require("../../models/user.model");
+const LiveStreamer = require("../../models/liveStreamer.model");
+const Block = require("../../models/block.model");
 
 //private key
 const admin = require("../../util/privateKey");
@@ -22,6 +24,12 @@ exports.followUnfollow = async (req, res) => {
 
     const fromUserId = new mongoose.Types.ObjectId(req.user.userId);
     const toUserId = new mongoose.Types.ObjectId(req.query.toUserId);
+
+    // Check if target user has blocked the requesting user
+    const isBlockedByTarget = await Block.exists({ userId: toUserId, toUserId: fromUserId });
+    if (isBlockedByTarget) {
+      return res.status(200).json({ status: false, message: "You cannot follow this user.", isBlocked: true });
+    }
 
     const [fromUser, toUser, alreadyFollowing] = await Promise.all([
       User.findById(fromUserId).select("_id name image isBlock image").lean(),
@@ -53,6 +61,24 @@ exports.followUnfollow = async (req, res) => {
       });
 
       await FollowerFollowing.deleteOne({ fromUserId, toUserId });
+
+      // Emit real-time follow status change to the target user and live room
+      if (global.io) {
+        const followEventData = {
+          fromUserId: fromUserId.toString(),
+          fromUserName: fromUser?.name || "",
+          fromUserImage: fromUser?.image || "",
+          toUserId: toUserId.toString(),
+          isFollow: false,
+        };
+        global.io.in("globalRoom:" + toUserId.toString()).emit("followStatusChanged", followEventData);
+
+        // Also notify the live room if the target user is currently streaming
+        const liveStreamer = await LiveStreamer.findOne({ userId: toUserId }).select("_id").lean();
+        if (liveStreamer) {
+          global.io.in(liveStreamer._id.toString()).emit("viewerFollowStatusChanged", followEventData);
+        }
+      }
     } else {
       res.status(200).json({
         status: true,
@@ -61,6 +87,24 @@ exports.followUnfollow = async (req, res) => {
       });
 
       await new FollowerFollowing({ fromUserId, toUserId }).save();
+
+      // Emit real-time follow status change to the target user and live room
+      if (global.io) {
+        const followEventData = {
+          fromUserId: fromUserId.toString(),
+          fromUserName: fromUser?.name || "",
+          fromUserImage: fromUser?.image || "",
+          toUserId: toUserId.toString(),
+          isFollow: true,
+        };
+        global.io.in("globalRoom:" + toUserId.toString()).emit("followStatusChanged", followEventData);
+
+        // Also notify the live room if the target user is currently streaming
+        const liveStreamer = await LiveStreamer.findOne({ userId: toUserId }).select("_id").lean();
+        if (liveStreamer) {
+          global.io.in(liveStreamer._id.toString()).emit("viewerFollowStatusChanged", followEventData);
+        }
+      }
 
       if (toUser.isPushNotificationEnabled && !toUser.isBlock && toUser.fcmToken !== null) {
         const payload = {
@@ -420,6 +464,12 @@ exports.fetchUserSocialConnections = async (req, res) => {
     const toUserObjId = new mongoose.Types.ObjectId(toUserIdParam);
     const skip = (parseInt(start) - 1) * parseInt(limit);
     const pageLimit = parseInt(limit);
+
+    // Check if target user has blocked the requesting user
+    const isBlockedByTarget = await Block.exists({ userId: toUserObjId, toUserId: userId });
+    if (isBlockedByTarget) {
+      return res.status(200).json({ status: false, message: "You cannot view this content.", isBlocked: true });
+    }
 
     const userExists = await User.findById(toUserObjId).select("_id isBlock");
 

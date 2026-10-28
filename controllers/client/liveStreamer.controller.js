@@ -1,6 +1,7 @@
 const mongoose = require("mongoose");
 const moment = require("moment-timezone");
 const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
+const { buildTencentBlock, isTencentEnabled } = require("../../util/tencentUserSig");
 
 const LiveStreamer = require("../../models/liveStreamer.model");
 const LiveStreamerHistory = require("../../models/liveStreamerHistory.model");
@@ -87,6 +88,21 @@ exports.startLiveStream = async (req, res) => {
 
     const liveHistory = new LiveStreamerHistory(liveHistoryData);
 
+    // Build Tencent block if enabled (before creating LiveStreamer so we can store roomId)
+    let tencentBlock = null;
+    if (isTencentEnabled()) {
+      try {
+        tencentBlock = buildTencentBlock(
+          userObjectId.toString(),
+          null,
+          "live",
+          liveHistory._id.toString()
+        );
+      } catch (tencentError) {
+        console.error("Error building Tencent block:", tencentError);
+      }
+    }
+
     const newLiveUser = new LiveStreamer({
       userId: userObjectId,
       liveHistoryId: liveHistory._id,
@@ -96,12 +112,15 @@ exports.startLiveStream = async (req, res) => {
       agoraUid: agoraUID,
       country: user.country.toLowerCase() || "",
       countryFlagImage: user?.countryFlagImage || "",
+      tencentRoomId: tencentBlock?.roomId || "",
+      tencentUserId: tencentBlock?.userId || "",
     });
 
     res.status(200).json({
       status: true,
       message: "Live stream started successfully.",
       data: newLiveUser,
+      tencent: tencentBlock,
     });
 
     await Promise.all([
@@ -300,10 +319,29 @@ exports.initializeLiveStream = async (req, res) => {
     liveUser.country = user.country.toLowerCase() || "";
     liveUser.countryFlagImage = user?.countryFlagImage || "";
 
+    // Build Tencent block if enabled
+    let tencentBlock = null;
+    if (isTencentEnabled()) {
+      try {
+        tencentBlock = buildTencentBlock(
+          userObjectId.toString(),
+          null,
+          "audio",
+          liveHistory._id.toString()
+        );
+        // Store Tencent roomId in the liveUser
+        liveUser.tencentRoomId = tencentBlock?.roomId || "";
+        liveUser.tencentUserId = tencentBlock?.userId || "";
+      } catch (tencentError) {
+        console.error("Error building Tencent block:", tencentError);
+      }
+    }
+
     res.status(200).json({
       status: true,
       message: "Live stream initialized successfully.",
       data: liveUser._doc,
+      tencent: tencentBlock,
     });
 
     await Promise.all([
@@ -722,6 +760,8 @@ exports.fetchLiveStreamers = async (req, res) => {
           host2isProfilePicBanned: "$pkConfig.host2Details.isProfilePicBanned",
           host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", ""] },
           host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrame", 0] },
+          host2TencentRoomId: { $ifNull: ["$pkConfig.host2TencentRoomId", ""] },
+          host2TencentUserId: { $ifNull: ["$pkConfig.host2TencentUserId", ""] },
           localRank: "$pkConfig.localRank",
           localGiftCount: "$pkConfig.localGiftCount",
           remoteRank: "$pkConfig.remoteRank",
@@ -732,6 +772,10 @@ exports.fetchLiveStreamers = async (req, res) => {
           pkThumbnails: { $ifNull: ["$pkThumbnails", []] },
           pkStreamSources: { $ifNull: ["$pkStreamSources", []] },
           multiLiveStreamSources: { $ifNull: ["$multiLiveStreamSources", []] },
+          tencent: {
+            roomId: { $ifNull: ["$tencentRoomId", ""] },
+            userId: { $toString: "$userId" },
+          },
         },
       },
     ];
@@ -851,13 +895,120 @@ exports.fetchLiveStreamers = async (req, res) => {
               pkThumbnails: { $ifNull: ["$pkThumbnails", []] },
               pkStreamSources: { $ifNull: ["$pkStreamSources", []] },
               multiLiveStreamSources: { $ifNull: ["$multiLiveStreamSources", []] },
+              tencent: {
+                roomId: { $literal: "" },
+                userId: { $literal: "" },
+              },
             },
           },
           { $sample: { size: limit } },
         ])
       : Promise.resolve([]);
 
-    const [realLiveUsers, fakeLiveUsers] = await Promise.all([realLiveUsersPromise, fakeLiveUsersPromise]);
+    // Fetch user's own live stream (for reconnection scenarios)
+    // Only show if LiveStreamer exists AND user is still marked as live
+    const ownStreamPipeline = [
+      {
+        $match: {
+          userId: userId,
+          liveHistoryId: { $ne: null },
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          pipeline: [
+            {
+              $project: {
+                name: 1,
+                userName: 1,
+                image: 1,
+                isBlock: 1,
+                uniqueId: 1,
+                isVerified: 1,
+                isFake: 1,
+                wealthLevel: 1,
+                activeAvtarFrame: 1,
+                isProfilePicBanned: 1,
+              },
+            },
+          ],
+          as: "user",
+        },
+      },
+      { $unwind: { path: "$user", preserveNullAndEmptyArrays: false } },
+      {
+        $lookup: {
+          from: "wealthlevels",
+          localField: "user.wealthLevel",
+          foreignField: "_id",
+          pipeline: [{ $project: { image: 1, name: 1 } }],
+          as: "wealthDetails",
+        },
+      },
+      { $unwind: { path: "$wealthDetails", preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: "avtarframes",
+          localField: "user.activeAvtarFrame",
+          foreignField: "_id",
+          as: "avtarframeDetails",
+        },
+      },
+      { $unwind: { path: "$avtarframeDetails", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 1,
+          liveHistoryId: 1,
+          view: 1,
+          liveType: 1,
+          audioLiveType: 1,
+          privateCode: 1,
+          roomName: 1,
+          roomWelcome: 1,
+          roomImage: 1,
+          isPkMode: 1,
+          userId: 1,
+          bgTheme: 1,
+          admins: {
+            $map: {
+              input: { $ifNull: ["$admins", []] },
+              as: "admin",
+              in: "$$admin.adminUserId",
+            },
+          },
+          blockedUsers: {
+            $map: {
+              input: { $ifNull: ["$blockedUsers", []] },
+              as: "blocked",
+              in: "$$blocked.blockedUserId",
+            },
+          },
+          name: "$user.name",
+          userName: "$user.userName",
+          image: "$user.image",
+          isProfilePicBanned: "$user.isProfilePicBanned",
+          countryFlagImage: 1,
+          country: 1,
+          uniqueId: "$user.uniqueId",
+          isVerified: "$user.isVerified",
+          isFake: "$user.isFake",
+          avtarFrame: { $ifNull: ["$avtarframeDetails.image", ""] },
+          avtarFrameType: { $ifNull: ["$avtarframeDetails.type", 0] },
+          isOwnStream: { $literal: true },
+          tencent: {
+            roomId: { $ifNull: ["$tencentRoomId", ""] },
+            userId: { $toString: "$userId" },
+          },
+        },
+      },
+    ];
+
+    const ownStreamPromise = LiveStreamer.aggregate(ownStreamPipeline);
+
+    const [realLiveUsers, fakeLiveUsers, ownStream] = await Promise.all([realLiveUsersPromise, fakeLiveUsersPromise, ownStreamPromise]);
 
     if (liveType === "new") {
       realLiveUsers.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
@@ -871,15 +1022,30 @@ exports.fetchLiveStreamers = async (req, res) => {
       fakeLiveUsers.sort((a, b) => b.view - a.view);
     }
 
-    let combinedUsers = [...realLiveUsers, ...fakeLiveUsers];
+    // Add isOwnStream: false to other streams
+    realLiveUsers.forEach(user => user.isOwnStream = false);
+    fakeLiveUsers.forEach(user => user.isOwnStream = false);
+
+    // Put own stream first, then others
+    let combinedUsers = [...ownStream, ...realLiveUsers, ...fakeLiveUsers];
 
     const startIndex = (start - 1) * limit;
     const paginatedUsers = combinedUsers.slice(startIndex, startIndex + limit);
+
+    // Add Tencent config if enabled (userSig fetched separately at join time)
+    let tencentConfig = null;
+    if (isTencentEnabled()) {
+      tencentConfig = {
+        sdkAppId: global.settingJSON?.tencentSdkAppId || 0,
+        roomIdType: "string",
+      };
+    }
 
     return res.status(200).json({
       status: true,
       message: "Retrieved live user list successfully.",
       liveUserList: paginatedUsers,
+      tencentConfig: tencentConfig,
     });
   } catch (error) {
     console.error("Error in fetchLiveStreamers:", error);

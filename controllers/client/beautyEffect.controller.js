@@ -1,6 +1,7 @@
 const BeautyEffect = require("../../models/beautyEffect.model");
 
 // Get Beauty Effects
+// Supports filtering by provider: ?provider=deepar or ?provider=tencent
 exports.fetchBeautyEffects = async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.start) || 1, 1);
@@ -9,6 +10,18 @@ exports.fetchBeautyEffects = async (req, res) => {
 
     const filter = {};
     filter.isActive = true;
+
+    // Filter by provider if specified (deepar or tencent)
+    const provider = req.query.provider?.trim()?.toLowerCase();
+    if (provider && ["deepar", "tencent"].includes(provider)) {
+      filter.provider = provider;
+    }
+
+    // Filter by effectType if specified
+    const effectType = req.query.effectType?.trim()?.toLowerCase();
+    if (effectType && ["filter", "sticker", "makeup", "segmentation", "beauty"].includes(effectType)) {
+      filter.effectType = effectType;
+    }
 
     const effects = await BeautyEffect.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
 

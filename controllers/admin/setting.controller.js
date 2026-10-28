@@ -164,6 +164,24 @@ exports.modifySetting = async (req, res) => {
     setting.minCoinsForPayout = req.body.minCoinsForPayout ? parseInt(req.body.minCoinsForPayout) : setting.minCoinsForPayout;
     setting.agencyMinPayout = req.body.agencyMinPayout ? parseInt(req.body.agencyMinPayout) : setting.agencyMinPayout;
 
+    // Silver coin settings
+    setting.silverToCashOutRate = req.body.silverToCashOutRate ? parseInt(req.body.silverToCashOutRate) : setting.silverToCashOutRate;
+    setting.minSilverForPayout = req.body.minSilverForPayout ? parseInt(req.body.minSilverForPayout) : setting.minSilverForPayout;
+    setting.silverToGoldFee = req.body.silverToGoldFee ? parseInt(req.body.silverToGoldFee) : setting.silverToGoldFee;
+    setting.minSilverToConvert = req.body.minSilverToConvert ? parseInt(req.body.minSilverToConvert) : setting.minSilverToConvert;
+
+    // Tencent Effect - Android
+    setting.tencentEffectAppId = req.body.tencentEffectAppId ? parseInt(req.body.tencentEffectAppId) : setting.tencentEffectAppId;
+    setting.tencentEffectLicenseUrl = req.body.tencentEffectLicenseUrl ? req.body.tencentEffectLicenseUrl.trim() : setting.tencentEffectLicenseUrl;
+    setting.tencentEffectLicenseKey = req.body.tencentEffectLicenseKey ? req.body.tencentEffectLicenseKey.trim() : setting.tencentEffectLicenseKey;
+    setting.tencentEffectPackageName = req.body.tencentEffectPackageName ? req.body.tencentEffectPackageName.trim() : setting.tencentEffectPackageName;
+
+    // Tencent Effect - iOS
+    setting.tencentEffectIosAppId = req.body.tencentEffectIosAppId ? parseInt(req.body.tencentEffectIosAppId) : setting.tencentEffectIosAppId;
+    setting.tencentEffectIosLicenseUrl = req.body.tencentEffectIosLicenseUrl ? req.body.tencentEffectIosLicenseUrl.trim() : setting.tencentEffectIosLicenseUrl;
+    setting.tencentEffectIosLicenseKey = req.body.tencentEffectIosLicenseKey ? req.body.tencentEffectIosLicenseKey.trim() : setting.tencentEffectIosLicenseKey;
+    setting.tencentEffectIosPackageName = req.body.tencentEffectIosPackageName ? req.body.tencentEffectIosPackageName.trim() : setting.tencentEffectIosPackageName;
+
     if (req.body.privateKey) {
       setting.privateKey = typeof req.body.privateKey === "string" ? JSON.parse(req.body.privateKey.trim()) : req.body.privateKey;
     }
@@ -306,6 +324,10 @@ exports.modifySettingToggle = async (req, res) => {
       setting.isZegoEnabled = !setting.isZegoEnabled;
     } else if (req.query.type === "isThirdPartyGameEnabled") {
       setting.isThirdPartyGameEnabled = !setting.isThirdPartyGameEnabled;
+    } else if (req.query.type === "isTencentEnabled") {
+      setting.isTencentEnabled = !setting.isTencentEnabled;
+    } else if (req.query.type === "isTencentEffectEnabled") {
+      setting.isTencentEffectEnabled = !setting.isTencentEffectEnabled;
     } else {
       return res.status(200).json({ status: false, message: "type passed must be valid." });
     }

@@ -31,6 +31,12 @@ route.post("/checkMobileOrEmailExists", checkAccessWithSecretKey(), UserControll
 //get firebase UID using device UUID
 route.get("/fetchFirebaseUidByDeviceId", checkAccessWithSecretKey(), UserController.fetchFirebaseUidByDeviceId);
 
+//get all accounts by device ID
+route.get("/deviceAccounts", checkAccessWithSecretKey(), UserController.getDeviceAccounts);
+
+//switch account - get custom token for target user
+route.post("/switchAccount", checkAccessWithSecretKey(), UserController.switchAccount);
+
 //create firebase custom token using firebase UID
 route.get("/createFirebaseCustomToken", checkAccessWithSecretKey(), UserController.createFirebaseCustomToken);
 
@@ -39,6 +45,12 @@ route.post("/loginOrRegisterUser", validateAuthToken, checkAccessWithSecretKey()
 
 //update profile of the user
 route.patch("/updateUserProfile", validateUserToken, checkAccessWithSecretKey(), upload.single("image"), UserController.updateUserProfile);
+
+//update cover image of the user
+route.patch("/updateCoverImage", validateUserToken, checkAccessWithSecretKey(), upload.single("coverImage"), UserController.updateCoverImage);
+
+//delete cover image of the user
+route.delete("/deleteCoverImage", validateUserToken, checkAccessWithSecretKey(), UserController.deleteCoverImage);
 
 //verify username ( always be unique )
 route.get("/checkUserNameAvailability", validateUserToken, checkAccessWithSecretKey(), UserController.checkUserNameAvailability);
@@ -63,6 +75,9 @@ route.patch("/toggleNotificationPermission", checkAccessWithSecretKey(), UserCon
 
 //get user's coin
 route.get("/fetchUserCoinBalance", checkAccessWithSecretKey(), UserController.fetchUserCoinBalance);
+
+//convert silver to gold
+route.post("/convertSilverToGold", validateUserToken, checkAccessWithSecretKey(), UserController.convertSilverToGold);
 
 //search users (socialList/profileVisitor)
 route.get("/searchUsersByType", validateUserToken, checkAccessWithSecretKey(), UserController.searchUsersByType);

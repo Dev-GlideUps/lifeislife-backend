@@ -13,6 +13,7 @@ const HashTag = require("../../models/hashTag.model");
 const Song = require("../../models/song.model");
 const BannedDevice = require("../../models/bannedDevice.model");
 const HostApplication = require("../../models/hostApplication.model");
+const Block = require("../../models/block.model");
 
 //fs
 const fs = require("fs");
@@ -269,6 +270,91 @@ exports.fetchFirebaseUidByDeviceId = async (req, res) => {
   }
 };
 
+//get all accounts by device ID
+exports.getDeviceAccounts = async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+
+    if (!deviceId) {
+      return res.status(200).json({
+        status: false,
+        message: "Device ID is required.",
+      });
+    }
+
+    const accounts = await User.find({ identity: deviceId.trim(), isBlock: false })
+      .select("_id name userName email image uniqueId loginType firebaseUid createdAt")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    return res.status(200).json({
+      status: true,
+      message: "Device accounts fetched successfully.",
+      accounts,
+    });
+  } catch (error) {
+    console.error("Get Device Accounts Error:", error);
+    return res.status(500).json({ status: false, message: error.message || "Internal Server Error" });
+  }
+};
+
+//switch account - get custom token for target user
+exports.switchAccount = async (req, res) => {
+  try {
+    const { targetUserId, identity, deviceId } = req.body;
+
+    if (!targetUserId) {
+      return res.status(200).json({
+        status: false,
+        message: "Target user ID is required.",
+      });
+    }
+
+    if (!identity && !deviceId) {
+      return res.status(200).json({
+        status: false,
+        message: "Identity or device ID is required.",
+      });
+    }
+
+    const deviceIdentity = identity || deviceId;
+
+    // Find target user and verify it belongs to the device
+    const targetUser = await User.findOne({
+      _id: targetUserId,
+      identity: deviceIdentity.trim(),
+      isBlock: false,
+    }).lean();
+
+    if (!targetUser) {
+      return res.status(200).json({
+        status: false,
+        message: "User not found or does not belong to this device.",
+      });
+    }
+
+    if (!targetUser.firebaseUid) {
+      return res.status(200).json({
+        status: false,
+        message: "Firebase UID not found for this user.",
+      });
+    }
+
+    // Generate Firebase custom token
+    const firebaseAdmin = await admin;
+    const customToken = await firebaseAdmin.auth().createCustomToken(targetUser.firebaseUid);
+
+    return res.status(200).json({
+      status: true,
+      message: "Account switched successfully.",
+      customToken,
+    });
+  } catch (error) {
+    console.error("Switch Account Error:", error);
+    return res.status(500).json({ status: false, message: error.message || "Internal Server Error" });
+  }
+};
+
 //create firebase custom token using firebase UID
 exports.createFirebaseCustomToken = async (req, res) => {
   try {
@@ -331,7 +417,7 @@ exports.loginOrRegisterUser = async (req, res) => {
           if (req.file) deleteFile(req.file);
           return res.status(200).json({ status: false, message: "email is required." });
         }
-        userQuery = { email: email.trim(), loginType: 2 };
+        userQuery = { email: email.trim() }; // Same email = same account
         break;
       case 3:
         if (!identity && !email) {
@@ -346,15 +432,14 @@ exports.loginOrRegisterUser = async (req, res) => {
           if (req.file) deleteFile(req.file);
           return res.status(200).json({ status: false, message: "email must be required." });
         }
-
-        userQuery = { email: email.trim(), loginType: 4 };
+        userQuery = { email: email.trim() }; // Same email = same account
         break;
       case 5:
         if (!email) {
           if (req.file) deleteFile(req.file);
           return res.status(200).json({ status: false, message: "email is required." });
         }
-        userQuery = { email, loginType: 5 };
+        userQuery = { email: email.trim() }; // Same email = same account
         break;
       case 6:
         if (!facebookId) {
@@ -654,6 +739,103 @@ exports.updateUserProfile = async (req, res) => {
   }
 };
 
+//update cover image of the user
+exports.updateCoverImage = async (req, res) => {
+  try {
+    if (!req.user || !req.user.userId) {
+      if (req.file) deleteFile(req.file);
+      return res.status(401).json({ status: false, message: "Unauthorized access. Invalid token." });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.user.userId);
+
+    const user = await User.findById(userId);
+
+    if (!user) {
+      if (req.file) deleteFile(req.file);
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    if (user.isBlock) {
+      if (req.file) deleteFile(req.file);
+      return res.status(200).json({ status: false, message: "You are blocked by the admin." });
+    }
+
+    if (!req.file) {
+      return res.status(200).json({ status: false, message: "Cover image is required." });
+    }
+
+    // Delete old cover image if exists
+    const currentCoverImage = user.coverImage;
+    if (currentCoverImage && currentCoverImage.includes("storage")) {
+      const imagePath = path.join(__dirname, "..", "..", currentCoverImage);
+      if (fs.existsSync(imagePath)) {
+        fs.unlinkSync(imagePath);
+        console.log("Old cover image deleted:", imagePath);
+      }
+    }
+
+    user.coverImage = req.file.path;
+    await user.save();
+
+    return res.status(200).json({
+      status: true,
+      message: "Cover image updated successfully.",
+      coverImage: req.file.path,
+    });
+  } catch (error) {
+    if (req.file) deleteFile(req.file);
+    console.error("Error updating cover image:", error);
+    return res.status(500).json({ status: false, error: error.message || "Internal Server Error" });
+  }
+};
+
+//delete cover image of the user
+exports.deleteCoverImage = async (req, res) => {
+  try {
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ status: false, message: "Unauthorized access. Invalid token." });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.user.userId);
+
+    const user = await User.findById(userId);
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    if (user.isBlock) {
+      return res.status(200).json({ status: false, message: "You are blocked by the admin." });
+    }
+
+    if (!user.coverImage) {
+      return res.status(200).json({ status: false, message: "No cover image to delete." });
+    }
+
+    // Delete cover image file if exists
+    const currentCoverImage = user.coverImage;
+    if (currentCoverImage && currentCoverImage.includes("storage")) {
+      const imagePath = path.join(__dirname, "..", "..", currentCoverImage);
+      if (fs.existsSync(imagePath)) {
+        fs.unlinkSync(imagePath);
+        console.log("Cover image deleted:", imagePath);
+      }
+    }
+
+    user.coverImage = "";
+    await user.save();
+
+    return res.status(200).json({
+      status: true,
+      message: "Cover image deleted successfully.",
+    });
+  } catch (error) {
+    console.error("Error deleting cover image:", error);
+    return res.status(500).json({ status: false, error: error.message || "Internal Server Error" });
+  }
+};
+
 //get user profile
 exports.fetchUserProfile = async (req, res) => {
   try {
@@ -726,10 +908,10 @@ exports.getUserInfo = async (req, res) => {
 
     const userId = new mongoose.Types.ObjectId(req.user.userId);
 
-    const [user, totalFollowers, totalFollowing, totalVisitors, totalFriendsResult, liveSession, hostApplication] = await Promise.all([
+    const [user, totalFollowers, totalFollowing, totalVisitors, totalFriendsResult, liveSession, hostApplication, giftGalleryCountResult] = await Promise.all([
       User.findOne({ _id: userId })
         .select(
-          "_id name userName image isProfilePicBanned uniqueId bio age gender countryFlagImage country isVerified coin receivedCoins loginRewardCoins wealthLevel receivedGifts role agencyId agencyOwnerId isOnline isBusy isLive isFake audioCallRate videoCallRate isAudioCallEnabled isVideoCallEnabled topUpCoins ",
+          "_id name userName image coverImage isProfilePicBanned uniqueId bio age gender countryFlagImage country isVerified coin silverCoin receivedCoins loginRewardCoins wealthLevel receivedGifts role agencyId agencyOwnerId isOnline isBusy isLive isFake audioCallRate videoCallRate isAudioCallEnabled isVideoCallEnabled topUpCoins ",
         )
         .populate("wealthLevel", "level levelName levelImage coinThreshold permissions")
         .populate("hostLevel", "level name image")
@@ -756,6 +938,12 @@ exports.getUserInfo = async (req, res) => {
         .select("_id liveHistoryId isPkMode liveType seat isHostActiveInRoom privateCode audioLiveType blockedUsers")
         .lean(),
       HostApplication.findOne({ userId }).select("status reason reviewedAt createdAt").sort({ createdAt: -1 }).lean(),
+      // Count unique gift types received by the user
+      History.aggregate([
+        { $match: { type: 6, otherUserId: userId, giftId: { $ne: null } } },
+        { $group: { _id: "$giftId" } },
+        { $count: "total" },
+      ]),
     ]);
 
     if (!user) {
@@ -763,6 +951,7 @@ exports.getUserInfo = async (req, res) => {
     }
 
     const totalFriends = totalFriendsResult?.[0]?.totalFriends || 0;
+    const totalGiftGalleryCount = giftGalleryCountResult?.[0]?.total || 0;
 
     let status = "Offline";
     if (user.isOnline) status = "Online";
@@ -798,6 +987,7 @@ exports.getUserInfo = async (req, res) => {
         totalFollowing,
         totalFriends,
         totalVisitors,
+        totalGiftGalleryCount,
         liveUserObjId: liveSession?._id,
         liveHistoryId: liveSession?.liveHistoryId,
         liveType: liveSession?.liveType,
@@ -945,10 +1135,25 @@ exports.getTargetUserInfo = async (req, res) => {
     const loginUserId = new mongoose.Types.ObjectId(req.user.userId);
     const userId = new mongoose.Types.ObjectId(req.query.toUserId);
 
-    const [user, totalFollowers, totalFollowing, totalFriendsResult, totalVisitors, isFollowed, liveSession] = await Promise.all([
+    // Check block status between users
+    const [blockedByTarget, iBlockedTarget] = await Promise.all([
+      Block.exists({ userId: userId, toUserId: loginUserId }),   // target blocked me
+      Block.exists({ userId: loginUserId, toUserId: userId }),   // I blocked target
+    ]);
+
+    // isBlocked = I blocked someone, blockedBy = someone blocked me
+    const isBlocked = !!iBlockedTarget;
+    const blockedBy = !!blockedByTarget;
+
+    // If target user blocked me, cannot view their profile
+    if (blockedBy) {
+      return res.status(200).json({ status: false, message: "You cannot view this profile.", isBlocked, blockedBy });
+    }
+
+    const [user, totalFollowers, totalFollowing, totalFriendsResult, totalVisitors, isFollowed, liveSession, giftGalleryCountResult] = await Promise.all([
       User.findOne({ _id: userId })
         .select(
-          "_id name userName image isProfilePicBanned uniqueId bio age gender countryFlagImage country isVerified coin wealthLevel receivedGifts role agencyId agencyOwnerId isOnline isBusy isLive isFake audioCallRate videoCallRate isAudioCallEnabled isVideoCallEnabled topUpCoins ",
+          "_id name userName image coverImage isProfilePicBanned uniqueId bio age gender countryFlagImage country isVerified coin wealthLevel receivedGifts role agencyId agencyOwnerId isOnline isBusy isLive isFake audioCallRate videoCallRate isAudioCallEnabled isVideoCallEnabled topUpCoins ",
         )
         .populate("wealthLevel", "levelImage")
         .populate("hostLevel", "level name image")
@@ -975,6 +1180,12 @@ exports.getTargetUserInfo = async (req, res) => {
       LiveStreamer.findOne({ userId, liveHistoryId: { $ne: null } })
         .select("_id liveHistoryId isPkMode liveType seat isHostActiveInRoom privateCode audioLiveType blockedUsers")
         .lean(),
+      // Count unique gift types received by the user
+      History.aggregate([
+        { $match: { type: 6, otherUserId: userId, giftId: { $ne: null } } },
+        { $group: { _id: "$giftId" } },
+        { $count: "total" },
+      ]),
     ]);
 
     if (!user) {
@@ -982,6 +1193,7 @@ exports.getTargetUserInfo = async (req, res) => {
     }
 
     const totalFriends = totalFriendsResult?.[0]?.totalFriends || 0;
+    const totalGiftGalleryCount = giftGalleryCountResult?.[0]?.total || 0;
 
     let status = "Offline";
     if (user.isOnline) status = "Online";
@@ -1007,6 +1219,8 @@ exports.getTargetUserInfo = async (req, res) => {
     return res.status(200).json({
       status: true,
       message: "User profile retrieved successfully.",
+      isBlocked,   // I blocked this user
+      blockedBy,   // This user blocked me
       user: {
         ...user,
         status,
@@ -1014,6 +1228,7 @@ exports.getTargetUserInfo = async (req, res) => {
         totalFollowing,
         totalFriends,
         totalVisitors,
+        totalGiftGalleryCount,
         isFollowed: !!isFollowed,
         liveUserObjId: liveSession?._id,
         liveHistoryId: liveSession?.liveHistoryId,
@@ -1112,15 +1327,89 @@ exports.fetchUserCoinBalance = async (req, res) => {
       return res.status(401).json({ status: false, message: "User UID required for authentication." });
     }
 
-    const user = await User.findOne({ firebaseUid: userUid }).select("_id coin").lean();
+    const user = await User.findOne({ firebaseUid: userUid }).select("_id coin silverCoin").lean();
     if (!user) {
       return res.status(200).json({ status: false, message: "User not found." });
     }
 
-    return res.status(200).json({ status: true, message: "User coin balance retrieved successfully.", coinBalance: user.coin });
+    return res.status(200).json({ status: true, message: "User coin balance retrieved successfully.", coinBalance: user.coin, silverBalance: user.silverCoin || 0 });
   } catch (error) {
     console.error("Error fetching user coin balance:", error);
     return res.status(500).json({ status: false, message: "An error occurred while retrieving user coin balance.", error: error.message });
+  }
+};
+
+//convert silver to gold
+exports.convertSilverToGold = async (req, res) => {
+  try {
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ status: false, message: "Unauthorized access. Invalid token." });
+    }
+
+    const { amount, coin, silverAmount: silverAmountInput } = req.body;
+    const inputAmount = amount || coin || silverAmountInput;
+
+    if (!inputAmount || isNaN(inputAmount) || inputAmount <= 0) {
+      return res.status(200).json({ status: false, message: "Please enter a valid amount." });
+    }
+
+    const silverAmount = Math.floor(Number(inputAmount));
+
+    // Get conversion settings
+    const minSilverToConvert = settingJSON?.minSilverToConvert || 100;
+    const silverToGoldFee = settingJSON?.silverToGoldFee || 20; // percentage fee
+
+    if (silverAmount < minSilverToConvert) {
+      return res.status(200).json({ status: false, message: `Minimum ${minSilverToConvert} silver required to convert.` });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.user.userId);
+    const user = await User.findById(userId).select("silverCoin coin").lean();
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    const silverBalance = Number(user.silverCoin || 0);
+
+    if (silverAmount > silverBalance) {
+      return res.status(200).json({ status: false, message: "Insufficient silver balance." });
+    }
+
+    // Calculate gold after fee deduction
+    const feeAmount = Math.floor((silverAmount * silverToGoldFee) / 100);
+    const goldReceived = silverAmount - feeAmount;
+
+    // Update user balances
+    const updateResult = await User.updateOne(
+      { _id: userId, silverCoin: { $gte: silverAmount } },
+      {
+        $inc: {
+          silverCoin: -silverAmount,
+          coin: goldReceived,
+        },
+      }
+    );
+
+    if (updateResult.matchedCount === 0) {
+      return res.status(200).json({ status: false, message: "Insufficient silver balance." });
+    }
+
+    // Get updated balances
+    const updatedUser = await User.findById(userId).select("coin silverCoin").lean();
+
+    return res.status(200).json({
+      status: true,
+      message: `Successfully converted ${silverAmount} silver to ${goldReceived} gold.`,
+      silverDeducted: silverAmount,
+      feeApplied: feeAmount,
+      goldReceived: goldReceived,
+      newGoldBalance: updatedUser.coin,
+      newSilverBalance: updatedUser.silverCoin,
+    });
+  } catch (error) {
+    console.error("Convert Silver to Gold Error:", error);
+    return res.status(500).json({ status: false, message: error.message || "Internal Server Error" });
   }
 };
 

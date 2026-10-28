@@ -51,6 +51,24 @@ const settingSchema = new mongoose.Schema(
     zegoAppSign: { type: String, default: "" },
     zegoServerSecret: { type: String, default: "" },
 
+    // Tencent TRTC
+    isTencentEnabled: { type: Boolean, default: false },
+    tencentSdkAppId: { type: Number, default: 0 },
+    liveSdkProvider: { type: String, enum: ["agora", "zego", "tencent"], default: "agora" },
+
+    // Tencent Effect (Xmagic) - Android
+    isTencentEffectEnabled: { type: Boolean, default: false },
+    tencentEffectAppId: { type: Number, default: 0 },
+    tencentEffectLicenseUrl: { type: String, default: "" },
+    tencentEffectLicenseKey: { type: String, default: "" },
+    tencentEffectPackageName: { type: String, default: "" },
+
+    // Tencent Effect (Xmagic) - iOS
+    tencentEffectIosAppId: { type: Number, default: 0 },
+    tencentEffectIosLicenseUrl: { type: String, default: "" },
+    tencentEffectIosLicenseKey: { type: String, default: "" },
+    tencentEffectIosPackageName: { type: String, default: "" },
+
     privacyPolicyLink: { type: String, default: "PRIVACY POLICY LINK" },
     termsOfUsePolicyLink: { type: String, default: "TERMS OF USE POLICY LINK" },
     abouUpolicylink: { type: String, default: "ABOUT US POLICY LINK" },
@@ -67,6 +85,10 @@ const settingSchema = new mongoose.Schema(
 
     minCoinsToCashOut: { type: Number, default: 0 }, //min coin requried for convert coin to default currency i.e., 1000 coin = 1 $
     minCoinsForPayout: { type: Number, default: 0 },
+    silverToCashOutRate: { type: Number, default: 1000 }, // silver coins per $1 (e.g., 1000 silver = $1)
+    minSilverForPayout: { type: Number, default: 0 }, // minimum silver coins for payout
+    silverToGoldFee: { type: Number, default: 20 }, // percentage fee when converting silver to gold
+    minSilverToConvert: { type: Number, default: 100 }, // minimum silver to convert to gold
     agencyMinPayout: { type: Number, default: 0 },
 
     pkEndTime: { type: Number, default: 60 }, //max time in seconds

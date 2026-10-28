@@ -1,5 +1,8 @@
 ///import model
 const User = require("./models/user.model");
+
+//Tencent TRTC utility
+const { buildTencentBlock, isTencentEnabled } = require("./util/tencentUserSig");
 const ChatTopic = require("./models/chatTopic.model");
 const Chat = require("./models/chat.model");
 const Privatecall = require("./models/privatecall.model");
@@ -16,6 +19,7 @@ const Agency = require("./models/agency.model");
 const Setting = require("./models/setting.model");
 const Notification = require("./models/notification.model");
 const Block = require("./models/block.model");
+const FollowerFollowing = require("./models/followerFollowing.model");
 
 //generateHistoryUniqueId
 const generateHistoryUniqueId = require("./util/generateHistoryUniqueId");
@@ -54,6 +58,105 @@ const moment = require("moment-timezone");
 const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
 
 const { deleteFile } = require("./util/deletefile");
+
+// ==================== RECONNECTION GRACE PERIOD ====================
+// Store pending disconnects with timeouts for hosts
+// Key: `host:${userId}`, Value: { timeout, liveHistoryId, liveStreamerId, timestamp }
+const pendingHostDisconnects = new Map();
+
+// Grace period in milliseconds (30 seconds by default)
+const HOST_RECONNECT_GRACE_PERIOD = 30 * 1000;
+
+// Schedule a pending disconnect for a host
+function schedulePendingHostDisconnect(userId, liveHistoryId, liveStreamerId, cleanupCallback) {
+  const key = `host:${userId}`;
+
+  // Cancel any existing pending disconnect
+  cancelPendingHostDisconnect(userId);
+
+  console.log(`⏳ [RECONNECT] Host ${userId} disconnected. Waiting ${HOST_RECONNECT_GRACE_PERIOD / 1000}s for reconnection...`);
+
+  const timeout = setTimeout(async () => {
+    try {
+      console.log(`⌛ [RECONNECT] Grace period expired for host ${userId}. Ending live stream.`);
+      pendingHostDisconnects.delete(key);
+      await cleanupCallback();
+    } catch (error) {
+      console.error(`❌ [RECONNECT] Error during cleanup for host ${userId}:`, error);
+    }
+  }, HOST_RECONNECT_GRACE_PERIOD);
+
+  pendingHostDisconnects.set(key, {
+    timeout,
+    liveHistoryId,
+    liveStreamerId,
+    timestamp: Date.now(),
+  });
+  console.log(`[schedulePendingHostDisconnect] Timer scheduled with key: ${key}, all keys: [${Array.from(pendingHostDisconnects.keys()).join(', ')}]`);
+}
+
+// Cancel a pending disconnect (called when host reconnects)
+function cancelPendingHostDisconnect(userId) {
+  const key = `host:${userId}`;
+  const pending = pendingHostDisconnects.get(key);
+
+  if (pending) {
+    clearTimeout(pending.timeout);
+    pendingHostDisconnects.delete(key);
+    console.log(`✅ [RECONNECT] Host ${userId} reconnected! Cancelled pending disconnect.`);
+    return true;
+  }
+  return false;
+}
+
+// Check if host has a pending disconnect
+function hasPendingHostDisconnect(userId) {
+  const key = `host:${userId}`;
+  const exists = pendingHostDisconnects.has(key);
+  console.log(`[hasPendingHostDisconnect] Checking key: ${key}, exists: ${exists}, all keys: [${Array.from(pendingHostDisconnects.keys()).join(', ')}]`);
+  return exists;
+}
+// ==================== END RECONNECTION GRACE PERIOD ====================
+
+// Helper function to emit personalized liveViewersList to each socket in a room
+async function emitPersonalizedViewersList(io, roomId, viewersList) {
+  try {
+    const roomSockets = await io.in(roomId.toString()).fetchSockets();
+    const viewerUserIds = viewersList.map(v => v.userId);
+
+    for (const roomSocket of roomSockets) {
+      try {
+        const globalRoom = roomSocket.handshake?.query?.globalRoom;
+        const socketUserId = globalRoom?.split(":")[1];
+
+        if (!socketUserId || !mongoose.Types.ObjectId.isValid(socketUserId)) {
+          roomSocket.emit("liveViewersList", viewersList.map(v => ({ ...v, isFollow: false })));
+          continue;
+        }
+
+        const followingRecords = await FollowerFollowing.find({
+          fromUserId: new mongoose.Types.ObjectId(socketUserId),
+          toUserId: { $in: viewerUserIds }
+        }).select("toUserId").lean();
+
+        const followingSet = new Set(followingRecords.map(f => f.toUserId.toString()));
+
+        const personalizedList = viewersList.map(viewer => ({
+          ...viewer,
+          isFollow: followingSet.has(viewer.userId.toString())
+        }));
+
+        roomSocket.emit("liveViewersList", personalizedList);
+      } catch (err) {
+        console.error("[emitPersonalizedViewersList] Error for socket:", err);
+        roomSocket.emit("liveViewersList", viewersList.map(v => ({ ...v, isFollow: false })));
+      }
+    }
+  } catch (err) {
+    console.error("[emitPersonalizedViewersList] Error fetching sockets:", err);
+    io.in(roomId.toString()).emit("liveViewersList", viewersList.map(v => ({ ...v, isFollow: false })));
+  }
+}
 
 function createLuckyMultiplierGenerator(min = 1, max = 15) {
   let lastMultiplier = null;
@@ -142,6 +245,65 @@ io.on("connection", async (socket) => {
 
         await User.findByIdAndUpdate(user._id, { $set: { isOnline: true } }, { new: true });
         console.log(`User ${id} set to online`);
+
+        // Cancel pending disconnect when host's socket reconnects
+        if (hasPendingHostDisconnect(id)) {
+          console.log(`✅ [RECONNECT] Host ${id} socket reconnected. Cancelling pending disconnect.`);
+          cancelPendingHostDisconnect(id);
+
+          // Get user's live stream info to notify viewers
+          const liveHost = await User.findById(id).select("_id name liveStreamerId isLive").lean();
+
+          if (liveHost && liveHost.isLive && liveHost.liveStreamerId) {
+            const liveRoomId = liveHost.liveStreamerId.toString();
+
+            // Rejoin the host to the live room
+            if (!socket.rooms.has(liveRoomId)) {
+              socket.join(liveRoomId);
+              console.log(`✅ [RECONNECT] Host ${id} rejoined live room: ${liveRoomId}`);
+            }
+
+            // Notify viewers that host reconnected
+            io.in(liveRoomId).emit("hostReconnected", {
+              userId: id,
+              name: liveHost.name,
+              message: `Host ${liveHost.name} has reconnected!`
+            });
+
+            // Get and emit the co-host list (requested array) for multi-live
+            const liveStreamer = await LiveStreamer.findById(liveHost.liveStreamerId)
+              .select("requested liveType")
+              .lean();
+
+            if (liveStreamer && [3, 4].includes(liveStreamer.liveType)) {
+              io.in(liveRoomId).emit("callJoinRequestsRefreshed", liveStreamer.requested || []);
+              console.log(`✅ [RECONNECT] Emitted callJoinRequestsRefreshed for room: ${liveRoomId}`);
+            }
+
+            console.log(`✅ [RECONNECT] Host ${liveHost.name} reconnected successfully`);
+          }
+        } else {
+          // Check if user is a co-host in any multi-live session
+          const coHostLive = await LiveStreamer.findOne({
+            liveType: { $in: [3, 4] },
+            "requested.userId": new mongoose.Types.ObjectId(id),
+            "requested.isAccepted": true,
+          }).select("_id requested liveType userId").lean();
+
+          if (coHostLive) {
+            const liveRoomId = coHostLive._id.toString();
+
+            // Rejoin co-host to the live room
+            if (!socket.rooms.has(liveRoomId)) {
+              socket.join(liveRoomId);
+              console.log(`✅ [RECONNECT] Co-host ${id} rejoined live room: ${liveRoomId}`);
+            }
+
+            // Emit co-host list to everyone in the room
+            io.in(liveRoomId).emit("callJoinRequestsRefreshed", coHostLive.requested || []);
+            console.log(`✅ [RECONNECT] Co-host ${id} reconnected, emitted callJoinRequestsRefreshed for room: ${liveRoomId}`);
+          }
+        }
       }
     } catch (error) {
       console.error("Error updating user status:", error);
@@ -199,7 +361,7 @@ io.on("connection", async (socket) => {
 
     if (isBlocked) {
       console.log("If blocked, only notify sender (self) and stop");
-      return socket.emit("messageSent", "Message cannot be sent. One of the users has blocked the other.");
+      return socket.emit("chatBlocked", { status: false, message: "You cannot send messages to this user. You have been blocked.", isBlocked: true });
     }
 
     if (chatTopic && parseData?.messageType == 1) {
@@ -296,6 +458,20 @@ io.on("connection", async (socket) => {
         receiverUser = chatTopic.senderId;
       }
 
+      // Check if either user has blocked the other
+      const isBlocked = await Block.exists({
+        $or: [
+          { userId: senderUser._id, toUserId: receiverUser._id },
+          { userId: receiverUser._id, toUserId: senderUser._id },
+        ],
+      });
+
+      if (isBlocked) {
+        console.log("❌ [chatGiftMessageSent] Blocked - cannot send gift");
+        socket.emit("chatGiftBlocked", { status: false, message: "You cannot send gifts to this user.", isBlocked: true });
+        return;
+      }
+
       const coinPerGift = Math.abs(gift.coin || 0);
       const totalCoin = coinPerGift * giftCount;
 
@@ -332,7 +508,7 @@ io.on("connection", async (socket) => {
       const uniqueId = await generateHistoryUniqueId();
       const giftCategory = await GiftCategory.findById(gift.categoryId).lean();
 
-      const adminRate = Math.abs(settingJSON.adminRate ?? 10);
+      const adminRate = Math.abs(settingJSON.adminRate ?? 0);
       let adminCoin = Math.round((totalCoin * adminRate) / 100);
       let receiverCoin = totalCoin - adminCoin;
 
@@ -422,21 +598,14 @@ io.on("connection", async (socket) => {
 
       const isHost = Array.isArray(receiverUser.role) && receiverUser.role.includes(2) && receiverUser.agencyId && !receiverUser.isBlock && !receiverUser.isHostBlocked;
 
-      // Base update fields for every receiver
+      // Base update fields for every receiver - gifts go to silverCoin (not coin/gold)
       const updateFields = {
         $inc: {
           receivedCoins: receiverCoin,
           receivedGifts: giftCount,
-          coin: receiverCoin,
+          silverCoin: receiverCoin,
         },
       };
-
-      // For non-hosts → increment coin
-      // if (!isHost) {
-      //   console.log("For non-hosts → increment coin");
-
-      //   updateFields.$inc.coin = receiverCoin;
-      // }
 
       // For hosts → increment host-related fields only
       if (isHost) {
@@ -459,6 +628,7 @@ io.on("connection", async (socket) => {
         History.create({
           uniqueId,
           type: 25,
+          coinType: 2, // Silver transaction (chat gift received)
           userId: senderUser._id,
           otherUserId: receiverUser._id,
           giftCategoryId: giftCategory?._id,
@@ -710,8 +880,34 @@ io.on("connection", async (socket) => {
             channel,
           };
 
-          io.in("globalRoom:" + receiver._id.toString()).emit("incomingCall", dataOfVideoCall); // Notify receiver
-          io.in("globalRoom:" + caller._id.toString()).emit("callStarted", dataOfVideoCall); // Notify caller
+          // Add Tencent block for each user if enabled
+          if (isTencentEnabled()) {
+            try {
+              const callRoomId = `call_${caller._id.toString()}_${receiver._id.toString()}_${Date.now()}`;
+
+              // Caller's Tencent block
+              const callerTencentBlock = buildTencentBlock(caller._id.toString(), callRoomId, "call");
+
+              // Receiver's Tencent block (different userSig)
+              const receiverTencentBlock = buildTencentBlock(receiver._id.toString(), callRoomId, "call");
+
+              // Notify receiver with their own userSig
+              const receiverCallData = { ...dataOfVideoCall, tencent: receiverTencentBlock };
+              io.in("globalRoom:" + receiver._id.toString()).emit("incomingCall", receiverCallData);
+
+              // Notify caller with their own userSig
+              const callerCallData = { ...dataOfVideoCall, tencent: callerTencentBlock };
+              io.in("globalRoom:" + caller._id.toString()).emit("callStarted", callerCallData);
+            } catch (tencentError) {
+              console.error("Error building Tencent call blocks:", tencentError);
+              // Fallback to Agora
+              io.in("globalRoom:" + receiver._id.toString()).emit("incomingCall", dataOfVideoCall);
+              io.in("globalRoom:" + caller._id.toString()).emit("callStarted", dataOfVideoCall);
+            }
+          } else {
+            io.in("globalRoom:" + receiver._id.toString()).emit("incomingCall", dataOfVideoCall); // Notify receiver
+            io.in("globalRoom:" + caller._id.toString()).emit("callStarted", dataOfVideoCall); // Notify caller
+          }
 
           console.log(`Call successfully initiated: ${caller.name} → ${receiver.name}`);
 
@@ -1200,7 +1396,7 @@ io.on("connection", async (socket) => {
       }
 
       if (callHistory.isPrivate) {
-        const adminRate = Math.abs(settingJSON.adminRate ?? 10);
+        const adminRate = Math.abs(settingJSON.adminRate ?? 0);
         const adminCoin = Math.round((callCharge * adminRate) / 100);
         const receiverCoin = callCharge - adminCoin;
 
@@ -1222,20 +1418,13 @@ io.on("connection", async (socket) => {
 
           const isHost = Array.isArray(receiver.role) && receiver.role.includes(2) && receiver.agencyId && !receiver.isBlock && !receiver.isHostBlocked;
 
-          // Base update fields for every receiver
+          // Base update fields for every receiver - call earnings go to silverCoin (not coin/gold)
           const updateFields = {
             $inc: {
               receivedCoins: receiverCoin,
-              coin: receiverCoin,
+              silverCoin: receiverCoin,
             },
           };
-
-          // For non-hosts → increment coin
-          // if (!isHost) {
-          //   console.log("For non-hosts → increment coin");
-
-          //   updateFields.$inc.coin = receiverCoin;
-          // }
 
           // For hosts → increment host-related fields only
           if (isHost) {
@@ -1252,6 +1441,7 @@ io.on("connection", async (socket) => {
               {
                 $set: {
                   date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+                  coinType: 2, // Silver transaction (call earnings)
                 },
                 $inc: {
                   senderCoin: callCharge,
@@ -1350,10 +1540,12 @@ io.on("connection", async (socket) => {
 
       io.in(parsedData.liveUserObjId).emit("joinLiveRoom", data);
 
-      const [liveUser, topGifterStats, viewersList] = await Promise.all([
-        LiveStreamer.findOne({ _id: parsedData.liveUserObjId }).select("userId earnedCoins view").lean(),
-        TopGifter.aggregate([
-          { $match: { liveStreamerId: new mongoose.Types.ObjectId(parsedData.liveUserObjId) } },
+      // First get liveUser to get liveHistoryId
+      const liveUser = await LiveStreamer.findOne({ _id: parsedData.liveUserObjId }).select("userId earnedCoins view liveHistoryId").lean();
+
+      const [topGifterStats, viewersList] = await Promise.all([
+        liveUser?.liveHistoryId ? TopGifter.aggregate([
+          { $match: { liveHistoryId: new mongoose.Types.ObjectId(liveUser.liveHistoryId) } },
           {
             $unwind: "$gifters",
           },
@@ -1419,33 +1611,11 @@ io.on("connection", async (socket) => {
               gifters: { $push: "$gifters" },
             },
           },
-        ]),
+        ]) : Promise.resolve([]),
         LiveStreamerView.aggregate([
           {
             $match: {
               liveStreamerId: new mongoose.Types.ObjectId(parsedData.liveUserObjId),
-            },
-          },
-          {
-            $lookup: {
-              from: "followerfollowings",
-              localField: "userId",
-              foreignField: "toUserId",
-              pipeline: [
-                {
-                  $match: {
-                    fromUserId: new mongoose.Types.ObjectId(parsedData.userId),
-                  },
-                },
-                { $limit: 1 },
-                { $project: { _id: 1 } },
-              ],
-              as: "followData",
-            },
-          },
-          {
-            $addFields: {
-              isFollow: { $gt: [{ $size: "$followData" }, 0] },
             },
           },
           {
@@ -1465,7 +1635,6 @@ io.on("connection", async (socket) => {
               isVerified: 1,
               agoraUid: 1,
               membershipTierCode: 1,
-              isFollow: 1,
             },
           },
         ]),
@@ -1478,8 +1647,9 @@ io.on("connection", async (socket) => {
       }
 
       const topGifters = topGifterStats?.[0]?.gifters?.sort((a, b) => b.totalCoins - a.totalCoins)?.slice(0, 5) || [];
-      io.in(parsedData.liveUserObjId.toString()).emit("topLiveStreamGifter", topGifters);
-      io.in(parsedData.liveUserObjId.toString()).emit("liveViewersList", viewersList);
+      // Send top gifters only to the joining socket, not whole room
+      socket.emit("topLiveStreamGifter", topGifters);
+      await emitPersonalizedViewersList(io, parsedData.liveUserObjId, viewersList);
     } else {
       console.log("Sockets not able to emit");
     }
@@ -1611,7 +1781,9 @@ io.on("connection", async (socket) => {
             roomName: 1,
             roomWelcome: 1,
             roomImage: 1,
-            hostIsMuted: 1,
+            isHostMuteEnabled: { $eq: [{ $ifNull: ["$hostIsMuted", 0] }, 1] },
+            isCameraEnabled: { $ifNull: ["$isHostCameraEnabled", true] },
+            isHostOnBreak: { $ifNull: ["$isHostOnBreak", false] },
             seat: 1,
             isPkMode: 1,
             userId: 1,
@@ -1642,6 +1814,8 @@ io.on("connection", async (socket) => {
             host2Channel: "$pkConfig.host2Channel",
             host2LiveId: "$pkConfig.host2LiveId",
             host2ObjId: "$pkConfig.host2ObjId",
+            host2TencentRoomId: "$pkConfig.host2TencentRoomId",
+            host2TencentUserId: "$pkConfig.host2TencentUserId",
             localRank: "$pkConfig.localRank",
             localGiftCount: "$pkConfig.localGiftCount",
             remoteRank: "$pkConfig.remoteRank",
@@ -1661,6 +1835,10 @@ io.on("connection", async (socket) => {
                 in: "$$admin.adminUserId",
               },
             },
+            tencent: {
+              roomId: { $ifNull: ["$tencentRoomId", ""] },
+              userId: { $toString: "$userId" },
+            },
           },
         },
       ];
@@ -1670,6 +1848,11 @@ io.on("connection", async (socket) => {
       if (!liveUserInfo) {
         return socket.emit("singleLiveUserResponse", "Live user not found.");
       }
+
+      // Debug: Log host mute and camera status
+      console.log("[fetchSingleLiveUser] isHostMuteEnabled:", liveUserInfo.isHostMuteEnabled);
+      console.log("[fetchSingleLiveUser] isCameraEnabled:", liveUserInfo.isCameraEnabled);
+      console.log("[fetchSingleLiveUser] isHostOnBreak:", liveUserInfo.isHostOnBreak);
 
       socket.emit("singleLiveUserResponse", liveUserInfo);
     } catch (err) {
@@ -1719,15 +1902,23 @@ io.on("connection", async (socket) => {
 
     const { userId, liveUserObjId, liveHistoryId, agoraUid, liveType, host2LiveId, entryRide, entryRideType } = dataOfaddView;
 
-    if (!userId || !liveUserObjId || !liveHistoryId) {
-      console.log("[countLiveJoin] Missing userId or liveHistoryId or liveUserObjId");
+    // Validate required fields
+    if (!userId || !liveUserObjId) {
+      console.log("[countLiveJoin] Missing required fields - userId:", userId, "liveUserObjId:", liveUserObjId);
+      return;
+    }
+
+    // Validate ObjectId format
+    if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(liveUserObjId)) {
+      console.log("[countLiveJoin] Invalid ObjectId format - userId:", userId, "liveUserObjId:", liveUserObjId);
+      return;
     }
 
     const [user, liveUser, pkLiveUser, existLiveView] = await Promise.all([
       User.findById(userId)
         .select("_id name userName image isProfilePicBanned gender age countryFlagImage country uniqueId isVerified fcmToken activeAvtarFrame isBlock isPushNotificationEnabled")
         .lean(),
-      LiveStreamer.findOne({ _id: liveUserObjId }).select("userId earnedCoins view").lean(),
+      LiveStreamer.findOne({ _id: liveUserObjId }).select("userId earnedCoins view hostIsMuted isHostCameraEnabled kickedUsers liveType requested").lean(),
       LiveStreamer.findOne({ _id: liveUserObjId, isPkMode: true }).select("pkEndTime pkConfig.host1LiveId pkConfig.host2LiveId").lean(),
       LiveStreamerView.findOne({ userId, liveStreamerId: liveUserObjId }).lean(),
     ]);
@@ -1742,7 +1933,57 @@ io.on("connection", async (socket) => {
       return;
     }
 
-    if (!socket.rooms.has(liveUserObjId)) {
+    // Check if this is the host rejoining (reconnection scenario)
+    // For multi-live (liveType 3) and call-join (liveType 4), check both main host AND co-hosts in requested array
+    const isMainHost = liveUser.userId?.toString() === userId.toString();
+    const isCoHost = [3, 4].includes(liveUser.liveType) && liveUser.requested?.some(
+      (req) => req.userId?.toString() === userId.toString() && req.isAccepted === true
+    );
+    const isHost = isMainHost || isCoHost;
+
+    // Debug logging for reconnection
+    console.log(`[countLiveJoin] 🔍 Reconnection check - userId: ${userId}, liveUser.userId: ${liveUser.userId}, isMainHost: ${isMainHost}, isCoHost: ${isCoHost}, isHost: ${isHost}`);
+    console.log(`[countLiveJoin] 🔍 hasPendingHostDisconnect(${userId}): ${hasPendingHostDisconnect(userId)}`);
+
+    if (isHost && hasPendingHostDisconnect(userId)) {
+      console.log(`[countLiveJoin] ✅ Cancelling pending disconnect for host ${userId}`);
+      cancelPendingHostDisconnect(userId);
+
+      // Notify viewers that host reconnected
+      io.in(liveUserObjId).emit("hostReconnected", {
+        userId: userId,
+        name: user.name,
+        message: `Host ${user.name} has reconnected!`
+      });
+      console.log(`[countLiveJoin] ✅ Host ${userId} reconnected via countLiveJoin`);
+    }
+
+    // Check if user is blocked by the host
+    const isBlockedByHost = await Block.exists({ userId: liveUser.userId, toUserId: new mongoose.Types.ObjectId(userId) });
+    if (isBlockedByHost) {
+      console.log(`[countLiveJoin] User ${userId} is blocked by host ${liveUser.userId}`);
+      socket.emit("blockedFromLive", { message: "You are blocked from this live stream." });
+      return;
+    }
+
+    // Check if user was kicked from THIS specific live session
+    // Kicked users cannot rejoin the same live session, but can join new sessions by the same host
+    const isKickedFromSession = liveUser.kickedUsers?.some(
+      (kicked) => kicked.kickedUserId?.toString() === userId.toString()
+    );
+    if (isKickedFromSession) {
+      console.log(`[countLiveJoin] User ${userId} was kicked from this live session`);
+      socket.emit("kickedFromLive", {
+        liveUserObjId: liveUserObjId,
+        liveHistoryId: liveHistoryId,
+        reason: "kicked",
+        message: "You have been kicked from this live session and cannot rejoin."
+      });
+      return;
+    }
+
+    const isNewJoin = !socket.rooms.has(liveUserObjId);
+    if (isNewJoin) {
       socket.join(liveUserObjId);
       console.log(`[countLiveJoin] User ${userId} joined room: ${liveUserObjId}`);
     } else {
@@ -1797,12 +2038,18 @@ io.on("connection", async (socket) => {
         avtarFrameType: avtarFrameType,
         ...safeUserFields,
       });
+    } else if (!existLiveView.liveUserId) {
+      // Fix: Update liveUserId if it's missing (for old records)
+      console.log("[countLiveJoin] Updating existing LiveView entry with liveUserId");
+      await LiveStreamerView.updateOne(
+        { _id: existLiveView._id },
+        { $set: { liveUserId: liveUser.userId } }
+      );
     }
 
-    const matchStage =
-      // liveHistoryId && liveHistoryId !== "" ?
-      // { $match: { liveHistoryId: new mongoose.Types.ObjectId(liveHistoryId) } } :
-      { $match: { liveStreamerId: new mongoose.Types.ObjectId(liveUserObjId) } };
+    const matchStage = liveHistoryId && liveHistoryId !== ""
+      ? { $match: { liveHistoryId: new mongoose.Types.ObjectId(liveHistoryId) } }
+      : { $match: { liveStreamerId: new mongoose.Types.ObjectId(liveUserObjId) } };
 
     const [totalViews, viewersList, seatedUsers, topGifterStats, updatedLiveUser] = await Promise.all([
       LiveStreamerView.countDocuments({ liveStreamerId: liveUserObjId }),
@@ -1810,28 +2057,6 @@ io.on("connection", async (socket) => {
         {
           $match: {
             liveStreamerId: new mongoose.Types.ObjectId(liveUserObjId),
-          },
-        },
-        {
-          $lookup: {
-            from: "followerfollowings",
-            localField: "liveUserId", // live stream host
-            foreignField: "toUserId",
-            pipeline: [
-              {
-                $match: {
-                  fromUserId: new mongoose.Types.ObjectId(userId),
-                }, // viewer
-              },
-              { $limit: 1 },
-              { $project: { _id: 1 } },
-            ],
-            as: "followData",
-          },
-        },
-        {
-          $addFields: {
-            isFollow: { $gt: [{ $size: "$followData" }, 0] },
           },
         },
         {
@@ -1850,7 +2075,6 @@ io.on("connection", async (socket) => {
             uniqueId: 1,
             isVerified: 1,
             agoraUid: 1,
-            isFollow: 1,
           },
         },
       ]),
@@ -1997,12 +2221,132 @@ io.on("connection", async (socket) => {
       entryRideType,
     };
 
-    io.in(liveUserObjId).emit("topLiveStreamGifter", topGifters);
+    // Send top gifters directly to the new viewer (not whole room)
+    socket.emit("topLiveStreamGifter", topGifters);
     io.in(liveUserObjId).emit("countLiveJoin", totalViews);
-    io.in(liveUserObjId).emit("userJoinedLive", data);
-    io.in(liveUserObjId).emit("liveViewersList", viewersList);
+
+    // Enhanced userJoinedLive with full user details for clickable system messages
+    const userJoinedData = {
+      ...dataOfaddView,
+      isHost: isHost,
+      user: {
+        _id: user._id,
+        userId: user._id,
+        name: user.name,
+        userName: user.userName,
+        image: user.image,
+        isProfilePicBanned: user.isProfilePicBanned,
+        gender: user.gender,
+        age: user.age,
+        countryFlagImage: user.countryFlagImage,
+        country: user.country,
+        uniqueId: user.uniqueId,
+        isVerified: user.isVerified,
+        avtarFrame: avtarFrameImage,
+        avtarFrameType: avtarFrameType,
+      }
+    };
+    io.in(liveUserObjId).emit("userJoinedLive", userJoinedData);
     io.in(liveUserObjId).emit("seatedUsersUpdate", seatedUsers);
     io.in(liveUserObjId).emit("fireEntryEffect", entryEffect);
+
+    // Emit singleLiveUserResponse with hostIsMuted and hostCamera to the joining viewer
+    const objId = new mongoose.Types.ObjectId(liveUserObjId);
+    const requestingUserId = new mongoose.Types.ObjectId(userId);
+
+    const singleLiveUserPipeline = [
+      { $match: { _id: objId } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          pipeline: [{ $project: { name: 1, userName: 1, image: 1, isProfilePicBanned: 1, countryFlagImage: 1, country: 1, uniqueId: 1, coin: 1, isVerified: 1, isFake: 1, wealthLevel: 1, activeAvtarFrame: 1, isBlock: 1 } }],
+          as: "user",
+        },
+      },
+      { $unwind: { path: "$user", preserveNullAndEmptyArrays: false } },
+      { $match: { "user.isBlock": false } },
+      {
+        $lookup: {
+          from: "wealthlevels",
+          localField: "user.wealthLevel",
+          foreignField: "_id",
+          pipeline: [{ $project: { levelImage: 1 } }],
+          as: "wealthDetails",
+        },
+      },
+      { $unwind: { path: "$wealthDetails", preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: "avtarframes",
+          localField: "user.activeAvtarFrame",
+          foreignField: "_id",
+          pipeline: [{ $project: { image: 1, type: 1 } }],
+          as: "avtarframeDetails",
+        },
+      },
+      { $unwind: { path: "$avtarframeDetails", preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: "followerfollowings",
+          localField: "userId",
+          foreignField: "toUserId",
+          pipeline: [{ $match: { fromUserId: requestingUserId } }, { $limit: 1 }, { $project: { _id: 1 } }],
+          as: "isFollow",
+        },
+      },
+      {
+        $lookup: {
+          from: "followerfollowings",
+          localField: "pkConfig.host2Id",
+          foreignField: "toUserId",
+          pipeline: [{ $match: { fromUserId: requestingUserId } }, { $limit: 1 }, { $project: { _id: 1 } }],
+          as: "host2IsFollow",
+        },
+      },
+      {
+        $project: {
+          _id: 1, token: 1, channel: 1, agoraUid: 1, liveHistoryId: 1, view: 1, liveType: 1, isAudio: 1, audioLiveType: 1, privateCode: 1, roomName: 1, roomWelcome: 1, roomImage: 1,
+          isHostMuteEnabled: { $eq: [{ $ifNull: ["$hostIsMuted", 0] }, 1] },
+          isCameraEnabled: { $ifNull: ["$isHostCameraEnabled", true] },
+          isHostOnBreak: { $ifNull: ["$isHostOnBreak", false] },
+          seat: 1, isPkMode: 1, userId: 1, bgTheme: 1,
+          name: "$user.name", userName: "$user.userName", image: "$user.image", isProfilePicBanned: "$user.isProfilePicBanned",
+          countryFlagImage: "$user.countryFlagImage", country: "$user.country", uniqueId: "$user.uniqueId", coin: "$user.coin", isVerified: "$user.isVerified", isFake: "$user.isFake",
+          wealthLevelImage: { $ifNull: ["$wealthDetails.levelImage", ""] },
+          avtarFrame: { $ifNull: ["$avtarframeDetails.image", ""] },
+          avtarFrameType: { $ifNull: ["$avtarframeDetails.type", 0] },
+          host2Id: "$pkConfig.host2Id", host2UniqueId: "$pkConfig.host2UniqueId", host2Name: "$pkConfig.host2Name", host2userName: "$pkConfig.host2userName", host2Image: "$pkConfig.host2Image",
+          host2isProfilePicBanned: "$pkConfig.host2Details.isProfilePicBanned", host2Coin: "$pkConfig.host2Details.coin", host2wealthLevelImage: "$pkConfig.host2Details.wealthLevelImage",
+          host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", ""] }, host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrame", 0] },
+          host2Channel: "$pkConfig.host2Channel", host2LiveId: "$pkConfig.host2LiveId", host2ObjId: "$pkConfig.host2ObjId",
+          host2TencentRoomId: "$pkConfig.host2TencentRoomId", host2TencentUserId: "$pkConfig.host2TencentUserId",
+          localRank: "$pkConfig.localRank", localGiftCount: "$pkConfig.localGiftCount", remoteRank: "$pkConfig.remoteRank", remoteGiftCount: "$pkConfig.remoteGiftCount",
+          host2IsFollow: { $gt: [{ $size: "$host2IsFollow" }, 0] },
+          isFollow: { $gt: [{ $size: "$isFollow" }, 0] },
+          viewers: { $ifNull: ["$viewers", []] },
+          streamSource: { $ifNull: ["$streamSource", ""] },
+          pkThumbnails: { $ifNull: ["$pkThumbnails", []] },
+          pkStreamSources: { $ifNull: ["$pkStreamSources", []] },
+          admins: { $map: { input: { $ifNull: ["$admins", []] }, as: "admin", in: "$$admin.adminUserId" } },
+          tencent: { roomId: { $ifNull: ["$tencentRoomId", ""] }, userId: { $toString: "$userId" } },
+        },
+      },
+    ];
+
+    // Only emit singleLiveUserResponse for NEW viewers joining the room
+    if (isNewJoin) {
+      const [singleLiveUserInfo] = await LiveStreamer.aggregate(singleLiveUserPipeline);
+      if (singleLiveUserInfo) {
+        singleLiveUserInfo.isHost = isHost;
+        socket.emit("singleLiveUserResponse", singleLiveUserInfo);
+        console.log(`[countLiveJoin] Emitted singleLiveUserResponse to ${isHost ? 'HOST' : 'viewer'} ${userId}: isHost=${isHost}`);
+      }
+    }
+
+    // Emit personalized liveViewersList to each socket
+    await emitPersonalizedViewersList(io, liveUserObjId, viewersList);
 
     if (updatedLiveUser) {
       io.in(liveUserObjId.toString()).emit("callJoinRequestsRefreshed", updatedLiveUser[0]?.requested || []);
@@ -2035,7 +2379,7 @@ io.on("connection", async (socket) => {
       }
 
       const [liveUser, existLiveView] = await Promise.all([
-        LiveStreamer.findOne({ _id: liveUserObjId }).select("_id view").lean(),
+        LiveStreamer.findOne({ _id: liveUserObjId }).select("_id view userId").lean(),
         LiveStreamerView.findOne({ userId, liveStreamerId: liveUserObjId }).lean(),
       ]);
 
@@ -2051,13 +2395,25 @@ io.on("connection", async (socket) => {
 
       const [totalViews, viewersList] = await Promise.all([
         LiveStreamerView.countDocuments({ liveStreamerId: liveUserObjId }),
-        LiveStreamerView.find({ liveStreamerId: liveUserObjId }).select("userId name userName image isProfilePicBanned avtarFrame").lean(),
+        LiveStreamerView.aggregate([
+          { $match: { liveStreamerId: new mongoose.Types.ObjectId(liveUserObjId) } },
+          {
+            $project: {
+              userId: 1,
+              name: 1,
+              userName: 1,
+              image: 1,
+              isProfilePicBanned: 1,
+              avtarFrame: 1,
+            },
+          },
+        ]),
       ]);
 
       console.log(`[reduceLiveJoiners] Updated total viewers for ${liveUserObjId}:`, totalViews);
 
       io.in(liveUserObjId).emit("reduceLiveJoiners", totalViews);
-      io.in(liveUserObjId).emit("liveViewersList", viewersList);
+      await emitPersonalizedViewersList(io, liveUserObjId, viewersList);
 
       await LiveStreamer.updateOne({ _id: liveUser._id }, { $set: { view: totalViews } });
 
@@ -2148,6 +2504,72 @@ io.on("connection", async (socket) => {
         });
 
         console.log(`[broadcastLiveComment] Comment saved for liveStreamerId: ${liveUserObjId}`);
+      }
+
+      // Send notifications to mentioned users
+      const { mentionedUserNames, senderName, senderUserId, senderImage } = dataOfComment;
+      if (mentionedUserNames && mentionedUserNames.length > 0) {
+        console.log(`[broadcastLiveComment] Mentioned users: ${mentionedUserNames.join(", ")}`);
+
+        // Find mentioned users by userName
+        const mentionedUsers = await User.find({
+          userName: { $in: mentionedUserNames },
+          _id: { $ne: senderUserId }, // Don't notify the sender
+          isBlock: false,
+        }).select("_id userName fcmToken isPushNotificationEnabled").lean();
+
+        console.log(`[broadcastLiveComment] Found ${mentionedUsers.length} users to notify`);
+
+        const notificationTitle = `${senderName} mentioned you!`;
+        const notificationMessage = `${senderName} mentioned you in a live stream comment`;
+
+        // Send push notification and save to DB for each mentioned user
+        const adminPromise = await admin;
+        for (const mentionedUser of mentionedUsers) {
+          try {
+            // Save notification to database
+            const notification = new Notification();
+            notification.userId = mentionedUser._id;
+            notification.otherUserId = senderUserId;
+            notification.title = notificationTitle;
+            notification.message = notificationMessage;
+            notification.image = senderImage || "";
+            notification.date = new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+            await notification.save();
+
+            // Send FCM push notification if enabled
+            if (mentionedUser.isPushNotificationEnabled && mentionedUser.fcmToken) {
+              const payload = {
+                token: mentionedUser.fcmToken,
+                notification: {
+                  title: notificationTitle,
+                  body: notificationMessage,
+                },
+                data: {
+                  type: "LIVE_MENTION",
+                  liveUserObjId: String(liveUserObjId),
+                  liveHistoryId: String(liveHistoryId),
+                  senderUserId: String(senderUserId),
+                  senderName: String(senderName || ""),
+                },
+              };
+
+              adminPromise
+                .messaging()
+                .send(payload)
+                .then((response) => {
+                  console.log(`[broadcastLiveComment] Push sent to @${mentionedUser.userName}:`, response);
+                })
+                .catch((err) => {
+                  console.error(`[broadcastLiveComment] Push error to @${mentionedUser.userName}:`, err.message);
+                });
+            }
+
+            console.log(`[broadcastLiveComment] Notification saved for @${mentionedUser.userName}`);
+          } catch (notifError) {
+            console.error(`[broadcastLiveComment] Failed to notify @${mentionedUser.userName}:`, notifError.message);
+          }
+        }
       }
 
       const socketCount = (await io.in(liveUserObjId).fetchSockets())?.length || 0;
@@ -2445,7 +2867,7 @@ io.on("connection", async (socket) => {
       const topGifters = topGifterData?.[0]?.gifters?.sort((a, b) => b.totalCoins - a.totalCoins)?.slice(0, 5) || [];
       io.in(liveUserObjId).emit("broadcastTopGifter", topGifters);
 
-      const adminRate = Math.abs(settingJSON.adminRate ?? 10);
+      const adminRate = Math.abs(settingJSON.adminRate ?? 0);
       let adminCoin = Math.round((totalCoin * adminRate) / 100);
 
       let estimatedReceiverCoin = 0;
@@ -2585,12 +3007,12 @@ io.on("connection", async (socket) => {
 
         const isHost = Array.isArray(receiverUser.role) && receiverUser.role.includes(2) && receiverUser.agencyId && !receiverUser.isBlock && !receiverUser.isHostBlocked;
 
-        // Base update fields for every receiver
+        // Base update fields for every receiver - gifts go to silverCoin (not coin/gold)
         const updateFields = {
           $inc: {
             receivedCoins: receiverCoin,
             receivedGifts: giftCount,
-            coin: receiverCoin,
+            silverCoin: receiverCoin,
           },
         };
 
@@ -2613,6 +3035,7 @@ io.on("connection", async (socket) => {
           History.create({
             uniqueId: uniqueId,
             type: 6,
+            coinType: 2, // Silver transaction (gift received)
             liveHistoryId: liveHistoryId,
             liveType: 1,
             userId: senderUser._id,
@@ -2863,12 +3286,23 @@ io.on("connection", async (socket) => {
 
       const { userId, liveHistoryId, liveUserObjId } = parsedData;
 
-      io.in(liveUserObjId).emit("endLiveStream", parsedData);
+      // Validate required fields
+      if (!userId || !liveHistoryId || !liveUserObjId) {
+        console.log("⚠️ [endLiveStream] Missing required fields");
+        return;
+      }
+
+      // Cancel any pending disconnect since host is intentionally ending
+      cancelPendingHostDisconnect(userId.toString());
+
+      // Convert to ObjectId
+      const userObjectId = new mongoose.Types.ObjectId(userId);
+      const liveHistoryObjectId = new mongoose.Types.ObjectId(liveHistoryId);
 
       const [user, liveUser, liveHistory] = await Promise.all([
-        User.findOne({ liveHistoryId }).select("_id isLive isBusy liveHistoryId name").lean(),
-        LiveStreamer.findOne({ userId, liveHistoryId }).select("_id userId liveHistoryId isAudio roomImage").lean(),
-        LiveStreamerHistory.findById(liveHistoryId).select("_id startTime").lean(),
+        User.findOne({ _id: userObjectId, liveHistoryId: liveHistoryObjectId }).select("_id isLive isBusy liveHistoryId name").lean(),
+        LiveStreamer.findOne({ userId: userObjectId, liveHistoryId: liveHistoryObjectId }).select("_id userId liveHistoryId isAudio roomImage").lean(),
+        LiveStreamerHistory.findById(liveHistoryObjectId).select("_id startTime").lean(),
       ]);
 
       if (!user) {
@@ -2886,8 +3320,13 @@ io.on("connection", async (socket) => {
         return;
       }
 
-      if (user.isLive && user.liveHistoryId && user.liveHistoryId !== null) {
-        if (liveUser && !liveUser.isAudio) {
+      // Delete LiveStreamer if it exists (don't check user.isLive as it may be false from disconnect)
+      if (liveUser) {
+        // Emit endLiveStream FIRST before removing sockets from room
+        io.in(liveUserObjId).emit("endLiveStream", parsedData);
+        console.log(`📢 Emitted endLiveStream to room: ${liveUserObjId}`);
+
+        if (!liveUser.isAudio) {
           const sockets = await io.in(liveUserObjId).fetchSockets();
           console.log(`🔄 Active sockets in room (${liveUserObjId}): ${sockets.length}`);
 
@@ -2906,20 +3345,17 @@ io.on("connection", async (socket) => {
             }
           }
 
-          await LiveStreamer.deleteOne({ userId, liveHistoryId });
+          await LiveStreamer.deleteOne({ _id: liveUser._id });
           console.log(`✅ LiveStreamer entry deleted for userId: ${userId}`);
         } else {
           console.log("🔊 liveUser.isAudio is true, skipping LiveStreamer deletion.");
 
           await LiveStreamer.updateOne(
-            { userId, liveHistoryId },
+            { _id: liveUser._id },
             {
               $set: {
                 liveHistoryId: null,
                 isHostActiveInRoom: false,
-                // agoraUid: 0,
-                // channel: "",
-                // token: "",
               },
             },
           );
@@ -2946,10 +3382,10 @@ io.on("connection", async (socket) => {
             },
           ),
           LiveStreamerHistory.updateOne({ _id: liveHistory._id }, { $set: { endTime, duration } }),
-          liveUser && !liveUser.isAudio ? LiveStreamerView.deleteMany({ liveStreamerId: liveUserObjId }) : Promise.resolve(),
-          liveUser && !liveUser.isAudio ? LiveStreamComment.deleteMany({ liveStreamerId: liveUserObjId }) : Promise.resolve(),
+          liveUser && !liveUser.isAudio ? LiveStreamerView.deleteMany({ liveStreamerId: liveUser._id }) : Promise.resolve(),
+          liveUser && !liveUser.isAudio ? LiveStreamComment.deleteMany({ liveStreamerId: liveUser._id }) : Promise.resolve(),
           liveUser && !liveUser.isAudio ? TopGifter.deleteMany({ liveHistoryId: liveHistory._id }) : Promise.resolve(),
-          clearLiveChatReferences([liveUserObjId], [liveHistory._id]),
+          clearLiveChatReferences([liveUser._id], [liveHistory._id]),
         ]);
 
         console.log(`✅ User ${user.name} is no longer live.`);
@@ -3037,13 +3473,15 @@ io.on("connection", async (socket) => {
     const parseData = JSON.parse(data);
     console.log("Received pkAnswer event with data:", parseData);
 
-    const [user1, user2] = await Promise.all([
+    const [user1, user2, liveStreamer1, liveStreamer2] = await Promise.all([
       User.findById(parseData.HOST_1_ID)
         .select("_id name userName coin image isProfilePicBanned isVerified gender age countryFlagImage country uniqueId isPushNotificationEnabled isBlock fcmToken")
         .lean(),
       User.findById(parseData.HOST_2_ID)
         .select("_id name userName coin image isProfilePicBanned isVerified gender age countryFlagImage country uniqueId isPushNotificationEnabled isBlock fcmToken")
         .lean(),
+      LiveStreamer.findOne({ userId: parseData.HOST_1_ID }).select("tencentRoomId tencentUserId").lean(),
+      LiveStreamer.findOne({ userId: parseData.HOST_2_ID }).select("tencentRoomId tencentUserId").lean(),
     ]);
 
     if (!user1) {
@@ -3099,6 +3537,8 @@ io.on("connection", async (socket) => {
               "pkConfig.host1LiveId": parseData.HOST_1_LIVEID,
               "pkConfig.host1Channel": parseData.HOST_1_CHANNEL,
               "pkConfig.host1AgoraUID": parseData.HOST_1_AGORA_ID,
+              "pkConfig.host1TencentUserId": liveStreamer1?.tencentUserId || "",
+              "pkConfig.host1TencentRoomId": liveStreamer1?.tencentRoomId || "",
 
               "pkConfig.host2Id": parseData.HOST_2_ID,
               "pkConfig.host2Name": parseData.HOST_2_NAME,
@@ -3109,6 +3549,8 @@ io.on("connection", async (socket) => {
               "pkConfig.host2LiveId": parseData.HOST_2_LIVEID,
               "pkConfig.host2Channel": parseData.HOST_2_CHANNEL,
               "pkConfig.host2AgoraUID": parseData.HOST_2_AGORA_ID,
+              "pkConfig.host2TencentUserId": liveStreamer2?.tencentUserId || "",
+              "pkConfig.host2TencentRoomId": liveStreamer2?.tencentRoomId || "",
 
               "pkConfig.host1Details": host1Details,
               "pkConfig.host2Details": host2Details,
@@ -3134,6 +3576,8 @@ io.on("connection", async (socket) => {
               "pkConfig.host1LiveId": parseData.HOST_2_LIVEID,
               "pkConfig.host1Channel": parseData.HOST_2_CHANNEL,
               "pkConfig.host1AgoraUID": parseData.HOST_2_AGORA_ID,
+              "pkConfig.host1TencentUserId": liveStreamer2?.tencentUserId || "",
+              "pkConfig.host1TencentRoomId": liveStreamer2?.tencentRoomId || "",
 
               "pkConfig.host2Id": parseData.HOST_1_ID,
               "pkConfig.host2Name": parseData.HOST_1_NAME,
@@ -3144,6 +3588,8 @@ io.on("connection", async (socket) => {
               "pkConfig.host2LiveId": parseData.HOST_1_LIVEID,
               "pkConfig.host2Channel": parseData.HOST_1_CHANNEL,
               "pkConfig.host2AgoraUID": parseData.HOST_1_AGORA_ID,
+              "pkConfig.host2TencentUserId": liveStreamer1?.tencentUserId || "",
+              "pkConfig.host2TencentRoomId": liveStreamer1?.tencentRoomId || "",
 
               "pkConfig.host1Details": host2Details,
               "pkConfig.host2Details": host1Details,
@@ -3164,12 +3610,50 @@ io.on("connection", async (socket) => {
         LiveStreamer.aggregate([
           { $match: { _id: liveUser2?._id } },
           { $addFields: { duration } },
-          { $project: { userId: 1, name: 1, token: 1, channel: 1, coin: 1, duration: 1, isPkMode: 1, pkConfig: 1, liveHistoryId: 1, view: 1 } },
+          {
+            $project: {
+              userId: 1,
+              name: 1,
+              token: 1,
+              channel: 1,
+              coin: 1,
+              duration: 1,
+              isPkMode: 1,
+              pkConfig: 1,
+              liveHistoryId: 1,
+              view: 1,
+              tencentRoomId: 1,
+              tencentUserId: 1,
+              tencent: {
+                roomId: { $ifNull: ["$tencentRoomId", ""] },
+                odcUserId: { $toString: "$userId" },
+              },
+            },
+          },
         ]),
         LiveStreamer.aggregate([
           { $match: { _id: liveUser1?._id } },
           { $addFields: { duration } },
-          { $project: { userId: 1, name: 1, token: 1, channel: 1, coin: 1, duration: 1, isPkMode: 1, pkConfig: 1, liveHistoryId: 1, view: 1 } },
+          {
+            $project: {
+              userId: 1,
+              name: 1,
+              token: 1,
+              channel: 1,
+              coin: 1,
+              duration: 1,
+              isPkMode: 1,
+              pkConfig: 1,
+              liveHistoryId: 1,
+              view: 1,
+              tencentRoomId: 1,
+              tencentUserId: 1,
+              tencent: {
+                roomId: { $ifNull: ["$tencentRoomId", ""] },
+                odcUserId: { $toString: "$userId" },
+              },
+            },
+          },
         ]),
       ]);
 
@@ -3353,7 +3837,7 @@ io.on("connection", async (socket) => {
         io.emit("proHighValueGift", data); //emit to all connected sockets regardless of room
       }
 
-      const adminRate = Math.abs(settingJSON.adminRate ?? 10);
+      const adminRate = Math.abs(settingJSON.adminRate ?? 0);
       let adminCoin = Math.round((totalCoin * adminRate) / 100);
       let receiverCoin = totalCoin - adminCoin;
 
@@ -3581,21 +4065,14 @@ io.on("connection", async (socket) => {
 
       const isHost = Array.isArray(receiverUser.role) && receiverUser.role.includes(2) && receiverUser.agencyId && !receiverUser.isBlock && !receiverUser.isHostBlocked;
 
-      // Base update fields for every receiver
+      // Base update fields for every receiver - gifts go to silverCoin (not coin/gold)
       const updateFields = {
         $inc: {
           receivedCoins: receiverCoin,
           receivedGifts: giftCount,
-          coin: receiverCoin,
+          silverCoin: receiverCoin,
         },
       };
-
-      // For non-hosts → increment coin
-      // if (!isHost) {
-      //   console.log("For non-hosts → increment coin");
-
-      //   updateFields.$inc.coin = receiverCoin;
-      // }
 
       // For hosts → increment host-related fields only
       if (isHost) {
@@ -3622,6 +4099,7 @@ io.on("connection", async (socket) => {
         History.create({
           uniqueId: uniqueId,
           type: 6,
+          coinType: 2, // Silver transaction (gift received)
           liveHistoryId: receiverPkLiveUser?.liveHistoryId,
           liveType: 3,
           userId: senderUser._id,
@@ -4785,31 +5263,35 @@ io.on("connection", async (socket) => {
       const parsedData = JSON.parse(data);
       console.log("Received data in seatMuted:", parsedData);
 
+      const { liveUserObjId, userId, position, mute } = parsedData;
+
       let liveUser;
-      if (parsedData.userId) {
+      // Update by userId if provided
+      if (userId) {
         liveUser = await LiveStreamer.findOneAndUpdate(
           {
-            _id: new mongoose.Types.ObjectId(parsedData.liveUserObjId),
-            "seat.userId": new mongoose.Types.ObjectId(parsedData.userId),
+            _id: new mongoose.Types.ObjectId(liveUserObjId),
+            "seat.userId": new mongoose.Types.ObjectId(userId),
           },
           {
             $set: {
-              "seat.$.mute": Number(parsedData.mute),
+              "seat.$.mute": Number(mute),
             },
           },
           { new: true },
         );
       }
 
-      if (parsedData.position !== -1) {
+      // Update by position if userId update failed or not provided
+      if (!liveUser && position !== undefined && position !== -1) {
         liveUser = await LiveStreamer.findOneAndUpdate(
           {
-            _id: new mongoose.Types.ObjectId(parsedData.liveUserObjId),
-            "seat.position": parsedData.position,
+            _id: new mongoose.Types.ObjectId(liveUserObjId),
+            "seat.position": position,
           },
           {
             $set: {
-              "seat.$.mute": Number(parsedData.mute),
+              "seat.$.mute": Number(mute),
             },
           },
           { new: true },
@@ -4817,16 +5299,27 @@ io.on("connection", async (socket) => {
       }
 
       if (liveUser) {
-        console.log("LiveUser updated successfully");
+        console.log("LiveUser updated successfully in seatMuted");
 
-        if (!socket.rooms.has(parsedData.liveUserObjId)) {
-          socket.join(parsedData.liveUserObjId.toString());
-          console.log(`[seatMuted] joined room: ${parsedData.liveUserObjId}`);
+        if (!socket.rooms.has(liveUserObjId)) {
+          socket.join(liveUserObjId.toString());
+          console.log(`[seatMuted] joined room: ${liveUserObjId}`);
         } else {
-          console.log(`[seatMuted] User is already in room: ${parsedData.liveUserObjId}`);
+          console.log(`[seatMuted] User is already in room: ${liveUserObjId}`);
         }
 
-        io.in(parsedData.liveUserObjId).emit("seatUpdate", liveUser);
+        // Emit seatUpdate to entire room
+        io.in(liveUserObjId).emit("seatUpdate", liveUser);
+
+        // Directly notify the muted/unmuted user
+        if (userId) {
+          io.in("globalRoom:" + userId.toString()).emit("muteStatusChanged", {
+            liveUserObjId: liveUserObjId,
+            mute: Number(mute),
+            mutedBy: "host"
+          });
+          console.log(`[seatMuted] Notified user ${userId} of mute status: ${mute}`);
+        }
       } else {
         console.log("LiveUser update failed or no matching document found");
       }
@@ -4853,7 +5346,7 @@ io.on("connection", async (socket) => {
       );
 
       if (liveUser) {
-        console.log("LiveUser updated successfully in hostIsMuted");
+        console.log("[hostSeatMuted] LiveUser updated - hostIsMuted:", liveUser.hostIsMuted);
 
         if (!socket.rooms.has(parsedData.liveUserObjId)) {
           socket.join(parsedData.liveUserObjId.toString());
@@ -4992,9 +5485,13 @@ io.on("connection", async (socket) => {
   socket.on("addToBlockedList", async (data) => {
     try {
       const parsedData = JSON.parse(data);
-      console.log("addToBlockedList data:  ", parsedData);
+      console.log("\n========== [KICK USER] START ==========");
+      console.log("[KICK USER] Received data:", JSON.stringify(parsedData, null, 2));
 
       const { liveUserObjId, liveHistoryId, blockedUserId } = parsedData;
+      console.log("[KICK USER] liveUserObjId:", liveUserObjId);
+      console.log("[KICK USER] liveHistoryId:", liveHistoryId);
+      console.log("[KICK USER] blockedUserId:", blockedUserId);
 
       const updatedLiveUser = await LiveStreamer.findOneAndUpdate(
         {
@@ -5014,20 +5511,100 @@ io.on("connection", async (socket) => {
         select: "_id name userName image isProfilePicBanned uniqueId isVerified",
       });
 
-      console.log("Updated Live User addToBlockedList: ", updatedLiveUser?.blockedUsers);
+      console.log("[KICK USER] LiveStreamer updated:", updatedLiveUser ? "YES" : "NO");
+      console.log("[KICK USER] Blocked users count:", updatedLiveUser?.blockedUsers?.length || 0);
 
       if (!socket.rooms.has(liveUserObjId)) {
         socket.join(liveUserObjId);
-        console.log(`[addToBlockedList] joined room: ${liveUserObjId}`);
+        console.log("[KICK USER] Host socket joined room:", liveUserObjId);
       } else {
-        console.log(`[addToBlockedList] User is already in room: ${liveUserObjId}`);
+        console.log("[KICK USER] Host socket already in room:", liveUserObjId);
       }
 
-      io.in("globalRoom:" + blockedUserId.toString()).emit("notifyBlockedUser", "Success");
+      // Notify the blocked user
+      const blockedUserGlobalRoom = "globalRoom:" + blockedUserId.toString();
+      console.log("[KICK USER] Emitting 'notifyBlockedUser' to:", blockedUserGlobalRoom);
+      io.in(blockedUserGlobalRoom).emit("notifyBlockedUser", "Success");
+
+      // Force the blocked user's socket(s) to leave the live room
+      console.log("[KICK USER] Fetching blocked user sockets from:", blockedUserGlobalRoom);
+      const blockedUserSockets = await io.in(blockedUserGlobalRoom).fetchSockets();
+      console.log("[KICK USER] Found blocked user sockets:", blockedUserSockets.length);
+
+      const roomId = liveUserObjId.toString();
+      for (const blockedSocket of blockedUserSockets) {
+        console.log("[KICK USER] Checking socket:", blockedSocket.id);
+        console.log("[KICK USER] Socket rooms:", Array.from(blockedSocket.rooms));
+
+        // Check both formats since rooms might be joined with or without .toString()
+        const isInRoom = blockedSocket.rooms.has(roomId) || blockedSocket.rooms.has(liveUserObjId);
+        console.log("[KICK USER] Socket is in live room:", isInRoom);
+
+        if (isInRoom) {
+          blockedSocket.leave(roomId);
+          blockedSocket.leave(liveUserObjId);
+          console.log("[KICK USER] ✅ Forced socket", blockedSocket.id, "to LEAVE room:", roomId);
+        } else {
+          console.log("[KICK USER] Socket not in room, skipping leave");
+        }
+      }
+
+      // Emit kicked event directly to the blocked user
+      console.log("[KICK USER] Emitting 'kickedFromLive' to:", blockedUserGlobalRoom);
+      io.in(blockedUserGlobalRoom).emit("kickedFromLive", {
+        liveUserObjId: liveUserObjId,
+        reason: "blocked"
+      });
+      console.log("[KICK USER] ✅ 'kickedFromLive' event emitted");
+
       io.in(liveUserObjId).emit("addToBlockedList", updatedLiveUser?.blockedUsers);
+      console.log("[KICK USER] ✅ 'addToBlockedList' event emitted to live room");
+
+      // Remove blocked user from viewer list and update count
+      const blockedUserObjectId = new mongoose.Types.ObjectId(blockedUserId);
+      const liveUserObjectId = new mongoose.Types.ObjectId(liveUserObjId);
+
+      const existLiveView = await LiveStreamerView.findOne({
+        userId: blockedUserObjectId,
+        liveStreamerId: liveUserObjectId
+      }).lean();
+
+      console.log("[KICK USER] User in LiveStreamerView:", existLiveView ? "YES" : "NO");
+
+      if (existLiveView) {
+        await LiveStreamerView.deleteOne({ _id: existLiveView._id });
+        console.log("[KICK USER] ✅ Removed user from LiveStreamerView");
+      }
+
+      const [totalViews, viewersList] = await Promise.all([
+        LiveStreamerView.countDocuments({ liveStreamerId: liveUserObjectId }),
+        LiveStreamerView.aggregate([
+          { $match: { liveStreamerId: liveUserObjectId } },
+          {
+            $project: {
+              userId: 1,
+              name: 1,
+              userName: 1,
+              image: 1,
+              isProfilePicBanned: 1,
+              avtarFrame: 1,
+            },
+          },
+        ]),
+      ]);
+
+      console.log("[KICK USER] Updated viewer count:", totalViews);
+      console.log("[KICK USER] Viewers list count:", viewersList.length);
+
+      await LiveStreamer.updateOne({ _id: liveUserObjectId }, { $set: { view: totalViews } });
+
+      io.in(liveUserObjId).emit("reduceLiveJoiners", totalViews);
+      await emitPersonalizedViewersList(io, liveUserObjId, viewersList);
+      console.log("[KICK USER] ✅ 'reduceLiveJoiners' and 'liveViewersList' emitted");
 
       const roomSockets = io.sockets.adapter.rooms.get(liveUserObjId);
-      console.log("Current room sockets in notifyBlockedUser: ", roomSockets);
+      console.log("[KICK USER] Sockets still in room:", roomSockets ? roomSockets.size : 0);
+      console.log("========== [KICK USER] END ==========\n");
 
       if (updatedLiveUser) {
         const hostId = updatedLiveUser.userId;
@@ -5069,6 +5646,274 @@ io.on("connection", async (socket) => {
       }
     } catch (error) {
       console.error("Error handling addToBlockedList event: ", error);
+    }
+  });
+
+  // Kick viewer from live room (temporary kick, does NOT add to blocked list)
+  socket.on("kickViewer", async (data) => {
+    try {
+      const parsedData = typeof data === "string" ? JSON.parse(data) : data;
+      console.log("\n========== [KICK VIEWER] START ==========");
+      console.log("[KICK VIEWER] Received data:", JSON.stringify(parsedData, null, 2));
+
+      const { liveHistoryId, liveUserObjId, kickedUserId } = parsedData;
+      console.log("[KICK VIEWER] liveHistoryId:", liveHistoryId);
+      console.log("[KICK VIEWER] liveUserObjId:", liveUserObjId);
+      console.log("[KICK VIEWER] kickedUserId:", kickedUserId);
+
+      if (!liveUserObjId || !kickedUserId) {
+        console.log("[KICK VIEWER] ❌ Missing required fields");
+        socket.emit("kickViewerError", { message: "Missing required fields" });
+        return;
+      }
+
+      // Verify the live stream exists
+      const liveStreamer = await LiveStreamer.findOne({
+        _id: liveUserObjId,
+        ...(liveHistoryId && { liveHistoryId: liveHistoryId })
+      }).lean();
+
+      if (!liveStreamer) {
+        console.log("[KICK VIEWER] ❌ Live stream not found");
+        socket.emit("kickViewerError", { message: "Live stream not found" });
+        return;
+      }
+      console.log("[KICK VIEWER] Live stream found:", liveStreamer._id);
+
+      // Force the kicked user's socket(s) to leave the live room
+      const kickedUserGlobalRoom = "globalRoom:" + kickedUserId.toString();
+      console.log("[KICK VIEWER] Fetching kicked user sockets from:", kickedUserGlobalRoom);
+      const kickedUserSockets = await io.in(kickedUserGlobalRoom).fetchSockets();
+      console.log("[KICK VIEWER] Found kicked user sockets:", kickedUserSockets.length);
+
+      const roomId = liveUserObjId.toString();
+      for (const kickedSocket of kickedUserSockets) {
+        console.log("[KICK VIEWER] Checking socket:", kickedSocket.id);
+        console.log("[KICK VIEWER] Socket rooms:", Array.from(kickedSocket.rooms));
+
+        const isInRoom = kickedSocket.rooms.has(roomId) || kickedSocket.rooms.has(liveUserObjId);
+        console.log("[KICK VIEWER] Socket is in live room:", isInRoom);
+
+        if (isInRoom) {
+          kickedSocket.leave(roomId);
+          kickedSocket.leave(liveUserObjId);
+          console.log("[KICK VIEWER] ✅ Forced socket", kickedSocket.id, "to LEAVE room:", roomId);
+        } else {
+          console.log("[KICK VIEWER] Socket not in room, skipping leave");
+        }
+      }
+
+      // Emit kicked event directly to the kicked user
+      console.log("[KICK VIEWER] Emitting 'kickedFromLive' to:", kickedUserGlobalRoom);
+      io.in(kickedUserGlobalRoom).emit("kickedFromLive", {
+        liveUserObjId: liveUserObjId,
+        liveHistoryId: liveHistoryId,
+        reason: "kicked"
+      });
+      console.log("[KICK VIEWER] ✅ 'kickedFromLive' event emitted");
+
+      // Notify live room that a viewer was kicked
+      io.in(liveUserObjId).emit("viewerKicked", {
+        kickedUserId: kickedUserId,
+        liveUserObjId: liveUserObjId
+      });
+      console.log("[KICK VIEWER] ✅ 'viewerKicked' event emitted to live room");
+
+      // Remove kicked user from viewer list and update count
+      const kickedUserObjectId = new mongoose.Types.ObjectId(kickedUserId);
+      const liveUserObjectId = new mongoose.Types.ObjectId(liveUserObjId);
+
+      const existLiveView = await LiveStreamerView.findOne({
+        userId: kickedUserObjectId,
+        liveStreamerId: liveUserObjectId
+      }).lean();
+
+      console.log("[KICK VIEWER] User in LiveStreamerView:", existLiveView ? "YES" : "NO");
+
+      if (existLiveView) {
+        await LiveStreamerView.deleteOne({ _id: existLiveView._id });
+        console.log("[KICK VIEWER] ✅ Removed user from LiveStreamerView");
+      }
+
+      const [totalViews, viewersList] = await Promise.all([
+        LiveStreamerView.countDocuments({ liveStreamerId: liveUserObjectId }),
+        LiveStreamerView.aggregate([
+          { $match: { liveStreamerId: liveUserObjectId } },
+          {
+            $project: {
+              userId: 1,
+              name: 1,
+              userName: 1,
+              image: 1,
+              isProfilePicBanned: 1,
+              avtarFrame: 1,
+            },
+          },
+        ]),
+      ]);
+
+      console.log("[KICK VIEWER] Updated viewer count:", totalViews);
+      console.log("[KICK VIEWER] Viewers list count:", viewersList.length);
+
+      // Add kicked user to kickedUsers list (session-specific, not permanent block)
+      // This prevents them from rejoining THIS live session only
+      await LiveStreamer.updateOne(
+        { _id: liveUserObjectId },
+        {
+          $set: { view: totalViews },
+          $addToSet: { kickedUsers: { kickedUserId: kickedUserObjectId, kickedAt: new Date() } }
+        }
+      );
+      console.log("[KICK VIEWER] ✅ Added user to kickedUsers list");
+
+      io.in(liveUserObjId).emit("reduceLiveJoiners", totalViews);
+      await emitPersonalizedViewersList(io, liveUserObjId, viewersList);
+      console.log("[KICK VIEWER] ✅ 'reduceLiveJoiners' and 'liveViewersList' emitted");
+
+      const roomSockets = io.sockets.adapter.rooms.get(liveUserObjId);
+      console.log("[KICK VIEWER] Sockets still in room:", roomSockets ? roomSockets.size : 0);
+
+      // Emit success to the host
+      socket.emit("kickViewerSuccess", {
+        kickedUserId: kickedUserId,
+        liveUserObjId: liveUserObjId,
+        viewerCount: totalViews
+      });
+      console.log("[KICK VIEWER] ✅ 'kickViewerSuccess' emitted to host");
+      console.log("========== [KICK VIEWER] END ==========\n");
+
+    } catch (error) {
+      console.error("[KICK VIEWER] ❌ Error:", error);
+      socket.emit("kickViewerError", { message: error.message });
+    }
+  });
+
+  // Mute/Unmute viewer in live room
+  socket.on("muteViewer", async (data) => {
+    try {
+      const parsedData = typeof data === "string" ? JSON.parse(data) : data;
+      console.log("\n========== [MUTE VIEWER] START ==========");
+      console.log("[MUTE VIEWER] Received data:", JSON.stringify(parsedData, null, 2));
+
+      const { liveHistoryId, liveUserObjId, mutedUserId, isMute } = parsedData;
+      console.log("[MUTE VIEWER] liveHistoryId:", liveHistoryId);
+      console.log("[MUTE VIEWER] liveUserObjId:", liveUserObjId);
+      console.log("[MUTE VIEWER] mutedUserId:", mutedUserId);
+      console.log("[MUTE VIEWER] isMute:", isMute);
+
+      if (!liveUserObjId || !mutedUserId || typeof isMute === "undefined") {
+        console.log("[MUTE VIEWER] ❌ Missing required fields");
+        socket.emit("muteViewerError", { message: "Missing required fields" });
+        return;
+      }
+
+      // Update mutedUsers array in LiveStreamer
+      let updatedLiveStreamer;
+      if (isMute) {
+        // Add to mutedUsers if not already present
+        updatedLiveStreamer = await LiveStreamer.findOneAndUpdate(
+          {
+            _id: liveUserObjId,
+            ...(liveHistoryId && { liveHistoryId: liveHistoryId }),
+            "mutedUsers.mutedUserId": { $ne: mutedUserId }
+          },
+          {
+            $push: {
+              mutedUsers: { mutedUserId: mutedUserId }
+            }
+          },
+          { new: true }
+        ).populate({
+          path: "mutedUsers.mutedUserId",
+          select: "_id name userName image"
+        });
+
+        // If user was already in list, just fetch the current state
+        if (!updatedLiveStreamer) {
+          updatedLiveStreamer = await LiveStreamer.findOne({
+            _id: liveUserObjId,
+            ...(liveHistoryId && { liveHistoryId: liveHistoryId })
+          }).populate({
+            path: "mutedUsers.mutedUserId",
+            select: "_id name userName image"
+          });
+        }
+        console.log("[MUTE VIEWER] ✅ User added to mutedUsers list");
+      } else {
+        // Remove from mutedUsers
+        updatedLiveStreamer = await LiveStreamer.findOneAndUpdate(
+          {
+            _id: liveUserObjId,
+            ...(liveHistoryId && { liveHistoryId: liveHistoryId })
+          },
+          {
+            $pull: {
+              mutedUsers: { mutedUserId: mutedUserId }
+            }
+          },
+          { new: true }
+        ).populate({
+          path: "mutedUsers.mutedUserId",
+          select: "_id name userName image"
+        });
+        console.log("[MUTE VIEWER] ✅ User removed from mutedUsers list");
+      }
+
+      if (!updatedLiveStreamer) {
+        console.log("[MUTE VIEWER] ❌ Live stream not found");
+        socket.emit("muteViewerError", { message: "Live stream not found" });
+        return;
+      }
+      console.log("[MUTE VIEWER] Live stream found:", updatedLiveStreamer._id);
+      console.log("[MUTE VIEWER] Muted users count:", updatedLiveStreamer.mutedUsers?.length || 0);
+
+      // Emit mute status change to the muted user's globalRoom
+      const mutedUserGlobalRoom = "globalRoom:" + mutedUserId.toString();
+      console.log("[MUTE VIEWER] Emitting 'muteStatusChanged' to:", mutedUserGlobalRoom);
+
+      io.in(mutedUserGlobalRoom).emit("muteStatusChanged", {
+        liveUserObjId: liveUserObjId,
+        liveHistoryId: liveHistoryId,
+        mute: isMute ? 1 : 0,
+        mutedBy: "host"
+      });
+      console.log("[MUTE VIEWER] ✅ 'muteStatusChanged' event emitted to user");
+
+      // Notify live room about mute status change
+      io.in(liveUserObjId).emit("viewerMuteStatusChanged", {
+        mutedUserId: mutedUserId,
+        liveUserObjId: liveUserObjId,
+        isMute: isMute
+      });
+      console.log("[MUTE VIEWER] ✅ 'viewerMuteStatusChanged' event emitted to live room");
+
+      // Emit notifyMutedInLive to the muted user
+      const mutedUserGlobalRoomNotify = "globalRoom:" + mutedUserId.toString();
+      io.in(mutedUserGlobalRoomNotify).emit("notifyMutedInLive", {
+        liveUserObjId: liveUserObjId,
+        liveHistoryId: liveHistoryId,
+        isMute: isMute,
+        mutedBy: "host"
+      });
+      console.log("[MUTE VIEWER] ✅ 'notifyMutedInLive' event emitted to user");
+
+      // Emit mutedUsersUpdated to live room with populated muted users list
+      const mutedUsersList = updatedLiveStreamer.mutedUsers || [];
+      io.in(liveUserObjId).emit("mutedUsersUpdated", mutedUsersList);
+      console.log("[MUTE VIEWER] ✅ 'mutedUsersUpdated' event emitted to live room:", JSON.stringify(mutedUsersList));
+
+      // Emit success to the host
+      socket.emit("muteViewerSuccess", {
+        mutedUserId: mutedUserId,
+        liveUserObjId: liveUserObjId,
+        isMute: isMute
+      });
+      console.log("[MUTE VIEWER] ✅ 'muteViewerSuccess' emitted to host");
+      console.log("========== [MUTE VIEWER] END ==========\n");
+
+    } catch (error) {
+      console.error("[MUTE VIEWER] ❌ Error:", error);
+      socket.emit("muteViewerError", { message: error.message });
     }
   });
 
@@ -5351,7 +6196,7 @@ io.on("connection", async (socket) => {
       const topGifters = topGifterData?.[0]?.gifters?.sort((a, b) => b.totalCoins - a.totalCoins)?.slice(0, 5) || [];
       io.in(giftData.liveUserObjId).emit("broadcastTopGifter", topGifters);
 
-      const adminRate = Math.abs(settingJSON.adminRate ?? 10);
+      const adminRate = Math.abs(settingJSON.adminRate ?? 0);
       let adminCoin = Math.round((totalCoinCostPerReceiver * adminRate) / 100);
 
       let estimatedReceiverCoin = 0;
@@ -5503,12 +6348,12 @@ io.on("connection", async (socket) => {
           hostTargetEngine.updateCoinProgress(receiverUser._id, receiverCoin);
         }
 
-        // Base update fields for every receiver
+        // Base update fields for every receiver - gifts go to silverCoin (not coin/gold)
         const updateFields = {
           $inc: {
             receivedCoins: receiverCoin,
             receivedGifts: giftCount,
-            coin: receiverCoin,
+            silverCoin: receiverCoin,
           },
         };
 
@@ -5531,6 +6376,7 @@ io.on("connection", async (socket) => {
           History.create({
             uniqueId,
             type: 6,
+            coinType: 2, // Silver transaction (gift received)
             liveHistoryId: giftData.liveHistoryId || null,
             liveType: 2,
             userId: senderUser._id,
@@ -6471,6 +7317,15 @@ io.on("connection", async (socket) => {
           io.in(liveUserObjId.toString()).emit("callJoinRequestsRefreshed", aggregatedLiveUser.requested);
           io.in(liveUserObjId.toString()).emit("callParticipantListUpdated", aggregatedLiveUser.participants);
         }
+
+        // Directly notify the muted/unmuted user
+        io.in("globalRoom:" + userId.toString()).emit("muteStatusChanged", {
+          liveUserObjId: liveUserObjId,
+          mute: isMute ? 1 : 0,
+          isMute: isMute,
+          mutedBy: "host"
+        });
+        console.log(`[callParticipantMuteUpdated] Notified user ${userId} of mute status: ${isMute}`);
       }
     } catch (error) {
       console.error("Error in callParticipantMuteUpdated:", error);
@@ -6539,15 +7394,17 @@ io.on("connection", async (socket) => {
       const parsedData = JSON.parse(data);
       console.log("Data received in callHostCameraUpdated:", parsedData);
 
-      const { liveUserObjId, liveHistoryId, isHostCameraEnabled } = parsedData;
+      const { liveUserObjId, liveHistoryId, isCameraEnabled } = parsedData;
 
       // Update and return the full document
-      const updatedHost = await LiveStreamer.findOneAndUpdate({ _id: new mongoose.Types.ObjectId(liveUserObjId) }, { $set: { isHostCameraEnabled: isHostCameraEnabled } }, { new: true }).lean();
+      const updatedHost = await LiveStreamer.findOneAndUpdate({ _id: new mongoose.Types.ObjectId(liveUserObjId) }, { $set: { isHostCameraEnabled: isCameraEnabled } }, { new: true }).lean();
 
       if (!updatedHost) {
         console.error("LiveUser not found or not of type host.");
         return;
       }
+
+      console.log(`[callHostCameraUpdated] DB updated: isCameraEnabled=${updatedHost.isHostCameraEnabled}`);
 
       const roomId = liveUserObjId.toString();
 
@@ -6573,12 +7430,17 @@ io.on("connection", async (socket) => {
 
       const { liveUserObjId, liveHistoryId, isHostMuteEnabled } = parsedData;
 
-      const updatedHost = await LiveStreamer.findOneAndUpdate({ _id: new mongoose.Types.ObjectId(liveUserObjId) }, { $set: { isHostMuteEnabled: isHostMuteEnabled } }, { new: true }).lean();
+      // Convert boolean to number: true (muted) = 1, false (unmuted) = 2
+      const hostIsMutedValue = isHostMuteEnabled ? 1 : 2;
+
+      const updatedHost = await LiveStreamer.findOneAndUpdate({ _id: new mongoose.Types.ObjectId(liveUserObjId) }, { $set: { hostIsMuted: hostIsMutedValue } }, { new: true }).lean();
 
       if (!updatedHost) {
         console.error("LiveUser not found or not of type host.");
         return;
       }
+
+      console.log(`[callHostMuteUpdated] DB updated: isHostMuteEnabled=${isHostMuteEnabled} (hostIsMuted=${updatedHost.hostIsMuted})`);
 
       const roomId = liveUserObjId.toString();
 
@@ -6594,6 +7456,37 @@ io.on("connection", async (socket) => {
       io.in(roomId).emit("callHostMuteUpdated", data);
     } catch (error) {
       console.error("Error in callHostMuteUpdated:", error);
+    }
+  });
+
+  socket.on("callHostBreakUpdated", async (data) => {
+    try {
+      const parsedData = JSON.parse(data);
+      console.log("Data received in callHostBreakUpdated:", parsedData);
+
+      const { liveUserObjId, liveHistoryId, isHostOnBreak } = parsedData;
+
+      const updatedHost = await LiveStreamer.findOneAndUpdate({ _id: new mongoose.Types.ObjectId(liveUserObjId) }, { $set: { isHostOnBreak: isHostOnBreak } }, { new: true }).lean();
+
+      if (!updatedHost) {
+        console.error("LiveUser not found or not of type host.");
+        return;
+      }
+
+      console.log(`[callHostBreakUpdated] DB updated: isHostOnBreak=${updatedHost.isHostOnBreak}`);
+
+      const roomId = liveUserObjId.toString();
+
+      if (!socket.rooms.has(roomId)) {
+        socket.join(roomId);
+        console.log(`[callHostBreakUpdated] joined room: ${roomId}`);
+      } else {
+        console.log(`[callHostBreakUpdated] User is already in room: ${roomId}`);
+      }
+
+      io.in(roomId).emit("callHostBreakUpdated", data);
+    } catch (error) {
+      console.error("Error in callHostBreakUpdated:", error);
     }
   });
 
@@ -6820,11 +7713,23 @@ io.on("connection", async (socket) => {
 
               const [updatedViewCount, viewersList] = await Promise.all([
                 LiveStreamerView.countDocuments({ liveStreamerId }),
-                LiveStreamerView.find({ liveStreamerId }).select("userId name userName image isProfilePicBanned avtarFrame").lean(),
+                LiveStreamerView.aggregate([
+                  { $match: { liveStreamerId: liveStreamerId } },
+                  {
+                    $project: {
+                      userId: 1,
+                      name: 1,
+                      userName: 1,
+                      image: 1,
+                      isProfilePicBanned: 1,
+                      avtarFrame: 1,
+                    },
+                  },
+                ]),
               ]);
 
               io.in(liveStreamerId.toString()).emit("reduceLiveJoiners", updatedViewCount);
-              io.in(liveStreamerId.toString()).emit("liveViewersList", viewersList);
+              await emitPersonalizedViewersList(io, liveStreamerId, viewersList);
 
               await LiveStreamer.updateOne({ _id: liveStreamerId }, { $set: { view: updatedViewCount } });
 
@@ -6840,44 +7745,105 @@ io.on("connection", async (socket) => {
           if (user.isLive && user.liveHistoryId && user.liveHistoryId !== null) {
             const [liveHistory, liveUser] = await Promise.all([
               LiveStreamerHistory.findById(user.liveHistoryId).select("_id startTime endTime duration").lean(),
-              LiveStreamer.findOne({ _id: user.liveStreamerId, userId }).select("_id isAudio roomImage").lean(),
+              LiveStreamer.findOne({ _id: user.liveStreamerId, userId }).select("_id isAudio roomImage isPkMode").lean(),
             ]);
 
-            if (liveUser) {
-              if (liveUser.isAudio) {
-                // Emit for audio live
-                io.in(user.liveStreamerId.toString()).emit("audioStreamUserLeft", `User ${user.name} left the audio live room.`);
-                console.log(`🔊 Audio Live: Emitted audioStreamUserLeft event for ${user.name}`);
-              } else {
-                // Emit for video live
-                io.in(user.liveStreamerId.toString()).emit("videoStreamUserLeft", `User ${user.name} left the video live room.`);
-                console.log(`📹 Video Live: Emitted videoStreamUserLeft event for ${user.name}`);
-              }
-            }
+            // For VIDEO live streams, use reconnection grace period
+            // For AUDIO live rooms, handle immediately (room persists without host)
+            // For PK mode, skip grace period (PK has its own end logic)
+            if (liveUser && !liveUser.isAudio && !liveUser.isPkMode) {
+              // Notify viewers that host is reconnecting
+              io.in(user.liveStreamerId.toString()).emit("hostDisconnected", {
+                userId: userId.toString(),
+                name: user.name,
+                reconnecting: true,
+                gracePeriod: HOST_RECONNECT_GRACE_PERIOD / 1000,
+                message: `Host ${user.name} disconnected. Waiting for reconnection...`
+              });
+              console.log(`📹 Video Live: Host ${user.name} disconnected. Starting grace period.`);
 
-            if (liveUser && !liveUser.isAudio) {
-              const sockets = await io.in(user.liveStreamerId.toString()).fetchSockets();
-              console.log(`🔄 Active sockets in room (${user.liveStreamerId.toString()}): ${sockets.length}`);
+              // Schedule pending disconnect with grace period
+              const userCopy = { ...user };
+              const liveHistoryCopy = liveHistory ? { ...liveHistory } : null;
+              const liveUserCopy = { ...liveUser };
 
-              if (sockets.length) {
-                io.socketsLeave(user.liveStreamerId.toString());
-                console.log(`✅ All sockets removed from room: ${user.liveStreamerId.toString()}`);
-              } else {
-                console.log("⚠️ No active sockets found to remove.");
-              }
+              const hostUserId = userId.toString();
+              const hostLiveStreamerId = user.liveStreamerId.toString();
+              const hostLiveHistoryId = user.liveHistoryId.toString();
 
-              if (liveUser && liveUser.roomImage) {
-                const roomImage = liveUser?.roomImage;
-                if (roomImage) {
-                  deleteFile(roomImage);
-                  console.log(`✅ Room image deleted: ${liveUser.roomImage}`);
+              schedulePendingHostDisconnect(
+                hostUserId,
+                hostLiveHistoryId,
+                hostLiveStreamerId,
+                async () => {
+                  // This runs after grace period expires if host doesn't reconnect
+                  console.log(`⌛ [RECONNECT] Executing cleanup for host ${hostUserId}`);
+
+                  // Emit endLiveStream FIRST before removing sockets (same format as manual end)
+                  io.in(hostLiveStreamerId).emit("endLiveStream", {
+                    userId: hostUserId,
+                    liveHistoryId: hostLiveHistoryId,
+                    liveUserObjId: hostLiveStreamerId
+                  });
+                  console.log(`📢 Emitted endLiveStream to room: ${hostLiveStreamerId} (grace period expired)`);
+
+                  // Also notify about reconnect failure
+                  io.in(hostLiveStreamerId).emit("hostReconnectFailed", {
+                    userId: hostUserId,
+                    message: "Host did not reconnect. Live stream ended."
+                  });
+
+                  const sockets = await io.in(hostLiveStreamerId).fetchSockets();
+                  console.log(`🔄 Active sockets in room (${hostLiveStreamerId}): ${sockets.length}`);
+
+                  if (sockets.length) {
+                    io.socketsLeave(hostLiveStreamerId);
+                    console.log(`✅ All sockets removed from room: ${hostLiveStreamerId}`);
+                  }
+
+                  if (liveUserCopy && liveUserCopy.roomImage) {
+                    deleteFile(liveUserCopy.roomImage);
+                    console.log(`✅ Room image deleted: ${liveUserCopy.roomImage}`);
+                  }
+
+                  await LiveStreamer.deleteOne({ _id: liveUserCopy._id });
+                  console.log(`✅ LiveStreamer entry deleted for host: ${hostUserId}`);
+
+                  const endTime = moment().tz("Asia/Kolkata").format();
+                  const startTime = liveHistoryCopy?.startTime || endTime;
+                  const start = moment.tz(startTime, "Asia/Kolkata");
+                  const end = moment.tz(endTime, "Asia/Kolkata");
+                  const duration = moment.utc(end.diff(start)).format("HH:mm:ss");
+                  const durationInMinutes = Math.floor(moment.duration(end.diff(start)).asMinutes());
+
+                  await Promise.all([
+                    liveHistoryCopy?._id ? LiveStreamerHistory.updateOne({ _id: liveHistoryCopy._id }, { $set: { endTime, duration } }) : Promise.resolve(),
+                    User.updateOne(
+                      { _id: userCopy._id },
+                      {
+                        $set: {
+                          isOnline: false,
+                          isLive: false,
+                          isBusy: false,
+                          liveHistoryId: null,
+                          liveStreamerId: null,
+                        },
+                      },
+                    ),
+                    LiveStreamerView.deleteMany({ liveStreamerId: userCopy.liveStreamerId }),
+                    LiveStreamComment.deleteMany({ liveStreamerId: userCopy.liveStreamerId }),
+                    TopGifter.deleteMany({ liveHistoryId: userCopy.liveHistoryId }),
+                    clearLiveChatReferences([userCopy.liveStreamerId], [userCopy.liveHistoryId]),
+                    typeof hostTargetEngine !== 'undefined' ? hostTargetEngine.updateLiveProgress(userCopy._id, durationInMinutes) : Promise.resolve(),
+                  ]);
+
+                  console.log(`✅ User ${userCopy?.name} is no longer live (after grace period).`);
                 }
-              }
-
-              await LiveStreamer.deleteOne({ userId, liveHistoryId: user.liveHistoryId });
-              console.log(`✅ LiveStreamer entry deleted for userId: ${userId}`);
-            } else {
-              console.log("🔊 liveUser.isAudio is true, skipping LiveStreamer deletion.");
+              );
+            } else if (liveUser && liveUser.isAudio) {
+              // Audio live room - host can leave and rejoin, room persists
+              io.in(user.liveStreamerId.toString()).emit("audioStreamUserLeft", `User ${user.name} left the audio live room.`);
+              console.log(`🔊 Audio Live: Emitted audioStreamUserLeft event for ${user.name}`);
 
               await LiveStreamer.updateOne(
                 { userId, liveHistoryId: user.liveHistoryId },
@@ -6885,46 +7851,38 @@ io.on("connection", async (socket) => {
                   $set: {
                     liveHistoryId: null,
                     isHostActiveInRoom: false,
-                    // agoraUid: 0,
-                    // channel: "",
-                    // token: "",
                   },
                 },
               );
 
               console.log(`✅ LiveStreamer updated for userId: ${userId}`);
-            }
 
-            const endTime = moment().tz("Asia/Kolkata").format();
+              const endTime = moment().tz("Asia/Kolkata").format();
+              const start = moment.tz(liveHistory?.startTime, "Asia/Kolkata");
+              const end = moment.tz(endTime, "Asia/Kolkata");
+              const duration = moment.utc(end.diff(start)).format("HH:mm:ss");
+              const durationInMinutes = Math.floor(moment.duration(end.diff(start)).asMinutes());
 
-            const start = moment.tz(liveHistory.startTime, "Asia/Kolkata");
-            const end = moment.tz(endTime, "Asia/Kolkata");
-            const duration = moment.utc(end.diff(start)).format("HH:mm:ss");
-            const durationInMinutes = Math.floor(moment.duration(end.diff(start)).asMinutes());
-
-            await Promise.all([
-              LiveStreamerHistory.updateOne({ _id: liveHistory?._id }, { $set: { endTime, duration } }),
-              User.updateOne(
-                { _id: user._id },
-                {
-                  $set: {
-                    isOnline: false,
-                    isLive: false,
-                    isBusy: false,
-                    liveHistoryId: null,
-                    liveStreamerId: null,
+              await Promise.all([
+                LiveStreamerHistory.updateOne({ _id: liveHistory?._id }, { $set: { endTime, duration } }),
+                User.updateOne(
+                  { _id: user._id },
+                  {
+                    $set: {
+                      isOnline: false,
+                      isLive: false,
+                      isBusy: false,
+                      liveHistoryId: null,
+                      liveStreamerId: null,
+                    },
                   },
-                },
-              ),
-              liveUser && !liveUser.isAudio ? LiveStreamerView.deleteMany({ liveStreamerId: user.liveStreamerId }) : Promise.resolve(),
-              liveUser && !liveUser.isAudio ? LiveStreamComment.deleteMany({ liveStreamerId: user.liveStreamerId }) : Promise.resolve(),
-              liveUser && !liveUser.isAudio ? TopGifter.deleteMany({ liveHistoryId: user.liveHistoryId }) : Promise.resolve(),
-              clearLiveChatReferences([user.liveStreamerId], [user.liveHistoryId]),
-              hostTargetEngine.updateLiveProgress(user._id, durationInMinutes),
-            ]);
+                ),
+                clearLiveChatReferences([user.liveStreamerId], [user.liveHistoryId]),
+                hostTargetEngine.updateLiveProgress(user._id, durationInMinutes),
+              ]);
 
-            console.log(`✅ User ${user?.name} is no longer live.`);
-            console.log("✅ Related liveViews deleted.");
+              console.log(`✅ Audio host ${user?.name} disconnected. Room still available.`);
+            }
           }
 
           if (user.callId && user.callId !== null) {
@@ -6975,19 +7933,33 @@ io.on("connection", async (socket) => {
             }
           }
 
-          await User.updateOne(
-            { _id: userId },
-            {
-              $set: {
-                isOnline: false,
-                isBusy: false,
-                isLive: false,
-                liveHistoryId: null,
-                liveStreamerId: null,
-                callId: null,
+          // Only fully reset user if there's no pending host disconnect (grace period active)
+          // If grace period is active, only set isOnline to false - the cleanup callback will handle the rest
+          if (hasPendingHostDisconnect(userId.toString())) {
+            await User.updateOne(
+              { _id: userId },
+              {
+                $set: {
+                  isOnline: false,
+                },
               },
-            },
-          );
+            );
+            console.log(`⏳ Grace period active for host ${userId}. Only setting isOnline: false.`);
+          } else {
+            await User.updateOne(
+              { _id: userId },
+              {
+                $set: {
+                  isOnline: false,
+                  isBusy: false,
+                  isLive: false,
+                  liveHistoryId: null,
+                  liveStreamerId: null,
+                  callId: null,
+                },
+              },
+            );
+          }
         }
       }
     }

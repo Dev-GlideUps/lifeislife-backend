@@ -413,31 +413,29 @@ exports.updateWithdrawalStatus = async (req, res) => {
           return res.status(200).json({ status: false, message: "Insufficient earnings balance." });
         }
       } else if ((request.person === 2 || request.person === 3) && request.userId) {
-        const user = await User.findById(request.userId).select("coin loginRewardCoins").lean();
+        const user = await User.findById(request.userId).select("silverCoin").lean();
 
         if (!user) {
           return res.status(200).json({ status: false, message: "User not found." });
         }
 
-        const totalCoins = Number(user.coin || 0);
-        const loginRewardCoins = Number(user.loginRewardCoins || 0);
-        const withdrawableCoins = totalCoins - loginRewardCoins; // only non-login-reward coins can be withdrawn
+        const silverBalance = Number(user.silverCoin || 0);
 
-        if (request.coin > withdrawableCoins) {
+        if (request.coin > silverBalance) {
           return res.status(200).json({
             status: false,
-            message: "Login bonus coins cannot be withdrawn. Only earned coins are eligible for payout.",
+            message: "Insufficient silver balance for payout.",
           });
         }
 
         const userUpdate = await User.updateOne(
           {
             _id: request.userId,
-            coin: { $gte: request.coin },
+            silverCoin: { $gte: request.coin },
           },
           {
             $inc: {
-              coin: -request.coin,
+              silverCoin: -request.coin,
               withdrawnCoins: request.coin,
               withdrawnAmount: request.amount,
             },
@@ -445,7 +443,7 @@ exports.updateWithdrawalStatus = async (req, res) => {
         );
 
         if (userUpdate.matchedCount === 0) {
-          return res.status(200).json({ status: false, message: "Insufficient coin balance." });
+          return res.status(200).json({ status: false, message: "Insufficient silver balance." });
         }
       }
 
