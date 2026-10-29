@@ -10,6 +10,8 @@ const liveStreamerHistorySchema = new mongoose.Schema(
     isPkMode: { type: Boolean, default: false },
     pkId: { type: Number, default: 0 },
     pkEndTime: { type: Date, default: null },
+    pkRoundsPlayed: { type: Number, default: 0 },
+    pkRoundsWon: { type: Number, default: 0 },
     earnedCoins: { type: Number, default: 0 },
     receivedGifts: { type: Number, default: 0 },
     viewerCount: { type: Number, default: 0 },

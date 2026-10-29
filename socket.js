@@ -59,6 +59,10 @@ const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
 
 const { deleteFile } = require("./util/deletefile");
 
+//pk session lifecycle
+const { PK_STATUS, getSessionForHost, buildPkPayload, computeDuration, createPkSession, setStartRequest, startPkRound, endPkRound, endPkSession } = require("./util/pkSession");
+const { getPkAvailabilityFor, UNAVAILABLE_MESSAGE } = require("./util/pkAvailability");
+
 // ==================== RECONNECTION GRACE PERIOD ====================
 // Store pending disconnects with timeouts for hosts
 // Key: `host:${userId}`, Value: { timeout, liveHistoryId, liveStreamerId, timestamp }
@@ -1786,6 +1790,12 @@ io.on("connection", async (socket) => {
             isHostOnBreak: { $ifNull: ["$isHostOnBreak", false] },
             seat: 1,
             isPkMode: 1,
+            pkId: 1,
+            pkStatus: 1,
+            pkRound: 1,
+            pkStartRequestedBy: 1,
+            host1Wins: "$pkConfig.host1Wins",
+            host2Wins: "$pkConfig.host2Wins",
             userId: 1,
             bgTheme: 1,
             name: "$user.name",
@@ -1809,8 +1819,8 @@ io.on("connection", async (socket) => {
             host2isProfilePicBanned: "$pkConfig.host2Details.isProfilePicBanned",
             host2Coin: "$pkConfig.host2Details.coin",
             host2wealthLevelImage: "$pkConfig.host2Details.wealthLevelImage",
-            host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", ""] },
-            host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrame", 0] },
+            host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrame", ""] },
+            host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", 0] },
             host2Channel: "$pkConfig.host2Channel",
             host2LiveId: "$pkConfig.host2LiveId",
             host2ObjId: "$pkConfig.host2ObjId",
@@ -1919,7 +1929,7 @@ io.on("connection", async (socket) => {
         .select("_id name userName image isProfilePicBanned gender age countryFlagImage country uniqueId isVerified fcmToken activeAvtarFrame isBlock isPushNotificationEnabled")
         .lean(),
       LiveStreamer.findOne({ _id: liveUserObjId }).select("userId earnedCoins view hostIsMuted isHostCameraEnabled kickedUsers liveType requested").lean(),
-      LiveStreamer.findOne({ _id: liveUserObjId, isPkMode: true }).select("pkEndTime pkConfig.host1LiveId pkConfig.host2LiveId").lean(),
+      LiveStreamer.findOne({ _id: liveUserObjId, isPkMode: true }).select("pkEndTime pkStatus pkId pkConfig.host1LiveId pkConfig.host2LiveId").lean(),
       LiveStreamerView.findOne({ userId, liveStreamerId: liveUserObjId }).lean(),
     ]);
 
@@ -1998,7 +2008,7 @@ io.on("connection", async (socket) => {
 
     //If PK mode active, emit PK rank update
     if (pkLiveUser) {
-      const duration = pkLiveUser.pkEndTime ? Math.round((new Date(pkLiveUser?.pkEndTime).getTime() - new Date().getTime()) / 1000) : 0;
+      const duration = computeDuration(pkLiveUser); //0 while in the lobby
 
       const [rankedLiveUser, topGifterHost1, topGifterHost2] = await Promise.all([
         LiveStreamer.aggregate([{ $match: { _id: pkLiveUser._id } }, { $addFields: { duration } }]),
@@ -2311,7 +2321,7 @@ io.on("connection", async (socket) => {
           isHostMuteEnabled: { $eq: [{ $ifNull: ["$hostIsMuted", 0] }, 1] },
           isCameraEnabled: { $ifNull: ["$isHostCameraEnabled", true] },
           isHostOnBreak: { $ifNull: ["$isHostOnBreak", false] },
-          seat: 1, isPkMode: 1, userId: 1, bgTheme: 1,
+          seat: 1, isPkMode: 1, pkId: 1, pkStatus: 1, pkRound: 1, pkStartRequestedBy: 1, host1Wins: "$pkConfig.host1Wins", host2Wins: "$pkConfig.host2Wins", userId: 1, bgTheme: 1,
           name: "$user.name", userName: "$user.userName", image: "$user.image", isProfilePicBanned: "$user.isProfilePicBanned",
           countryFlagImage: "$user.countryFlagImage", country: "$user.country", uniqueId: "$user.uniqueId", coin: "$user.coin", isVerified: "$user.isVerified", isFake: "$user.isFake",
           wealthLevelImage: { $ifNull: ["$wealthDetails.levelImage", ""] },
@@ -2319,7 +2329,7 @@ io.on("connection", async (socket) => {
           avtarFrameType: { $ifNull: ["$avtarframeDetails.type", 0] },
           host2Id: "$pkConfig.host2Id", host2UniqueId: "$pkConfig.host2UniqueId", host2Name: "$pkConfig.host2Name", host2userName: "$pkConfig.host2userName", host2Image: "$pkConfig.host2Image",
           host2isProfilePicBanned: "$pkConfig.host2Details.isProfilePicBanned", host2Coin: "$pkConfig.host2Details.coin", host2wealthLevelImage: "$pkConfig.host2Details.wealthLevelImage",
-          host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", ""] }, host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrame", 0] },
+          host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrame", ""] }, host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", 0] },
           host2Channel: "$pkConfig.host2Channel", host2LiveId: "$pkConfig.host2LiveId", host2ObjId: "$pkConfig.host2ObjId",
           host2TencentRoomId: "$pkConfig.host2TencentRoomId", host2TencentUserId: "$pkConfig.host2TencentUserId",
           localRank: "$pkConfig.localRank", localGiftCount: "$pkConfig.localGiftCount", remoteRank: "$pkConfig.remoteRank", remoteGiftCount: "$pkConfig.remoteGiftCount",
@@ -3301,7 +3311,7 @@ io.on("connection", async (socket) => {
 
       const [user, liveUser, liveHistory] = await Promise.all([
         User.findOne({ _id: userObjectId, liveHistoryId: liveHistoryObjectId }).select("_id isLive isBusy liveHistoryId name").lean(),
-        LiveStreamer.findOne({ userId: userObjectId, liveHistoryId: liveHistoryObjectId }).select("_id userId liveHistoryId isAudio roomImage").lean(),
+        LiveStreamer.findOne({ userId: userObjectId, liveHistoryId: liveHistoryObjectId }).select("_id userId liveHistoryId isAudio roomImage isPkMode pkId").lean(),
         LiveStreamerHistory.findById(liveHistoryObjectId).select("_id startTime").lean(),
       ]);
 
@@ -3322,6 +3332,15 @@ io.on("connection", async (socket) => {
 
       // Delete LiveStreamer if it exists (don't check user.isLive as it may be false from disconnect)
       if (liveUser) {
+        // Release the PK partner first so they return to a solo live
+        if (liveUser.isPkMode && liveUser.pkId) {
+          await endPkSession(liveUser.pkId, {
+            reason: "host_left",
+            endedBy: userId,
+            legacyPkEnd: { isManualMode: true, pkEndUserId: userId },
+          });
+        }
+
         // Emit endLiveStream FIRST before removing sockets from room
         io.in(liveUserObjId).emit("endLiveStream", parsedData);
         console.log(`📢 Emitted endLiveStream to room: ${liveUserObjId}`);
@@ -3402,18 +3421,33 @@ io.on("connection", async (socket) => {
       const parseData = JSON.parse(data);
       console.info("[PK_REQUEST] Received data:", parseData);
 
+      const senderId = parseData.host1Id || parseData.HOST_1_ID;
+      const receiverId = parseData.host2Id || parseData.HOST_2_ID;
+
       if (parseData.InstantCutRequestByHost) {
         console.info("[PK_REQUEST] Instant Cut Request By Host:", parseData.InstantCutRequestByHost);
 
-        io.in("globalRoom:" + parseData.host2Id).emit("pkRequestReceived", data);
+        io.in("globalRoom:" + String(receiverId)).emit("pkRequestReceived", data);
       } else {
-        console.info("[PK_REQUEST] Request accepted by host");
+        //Refuse invitations that cannot be accepted (sender not in a video live / in PK, invitee offline, not live, in PK or blocked)
+        const [targetRow, senderRow] = await Promise.all([getPkAvailabilityFor(receiverId, { requesterId: senderId }), getPkAvailabilityFor(senderId)]);
 
-        io.in("globalRoom:" + parseData.host2Id.toString()).emit("pkRequestReceived", data);
+        if (!senderRow.isAvailable) {
+          console.info("[PK_REQUEST] Sender not available:", senderRow.unavailableReason);
+          socket.emit("pkError", { event: "pkRequest", message: "You must be in a video live and not in a PK session to send an invitation.", unavailableReason: senderRow.unavailableReason });
+          return;
+        }
+
+        if (!targetRow.isAvailable) {
+          console.info("[PK_REQUEST] Invitee not available:", targetRow.unavailableReason);
+          socket.emit("pkError", { event: "pkRequest", message: UNAVAILABLE_MESSAGE[targetRow.unavailableReason] || "This host is not available for PK.", unavailableReason: targetRow.unavailableReason });
+          return;
+        }
+
+        console.info("[PK_REQUEST] Forwarding invitation to host2");
+
+        io.in("globalRoom:" + String(receiverId)).emit("pkRequestReceived", data);
       }
-
-      const senderId = parseData.host1Id || parseData.HOST_1_ID;
-      const receiverId = parseData.host2Id || parseData.HOST_2_ID;
 
       if (senderId && receiverId && senderId.toString() !== receiverId.toString()) {
         const [receiverUser, senderUser, isBlocked] = await Promise.all([
@@ -3469,317 +3503,354 @@ io.on("connection", async (socket) => {
     }
   });
 
+  //pk: the challenger withdraws a pending invitation so the invitee app can dismiss the dialog
+  socket.on("pkCancelRequest", async (data) => {
+    try {
+      const parsedData = JSON.parse(data);
+      const host1Id = String(parsedData?.host1Id || parsedData?.HOST_1_ID || id);
+      const host2Id = String(parsedData?.host2Id || parsedData?.HOST_2_ID || "");
+      console.log("[pkCancelRequest] Received data:", parsedData, "from:", id);
+
+      if (!mongoose.Types.ObjectId.isValid(host2Id)) {
+        return socket.emit("pkError", { event: "pkCancelRequest", message: "host2Id must be needed." });
+      }
+
+      if (host1Id !== String(id)) {
+        return socket.emit("pkError", { event: "pkCancelRequest", message: "Only the challenger can cancel the invitation." });
+      }
+
+      io.in("globalRoom:" + host2Id).emit("pkRequestCancelled", { host1Id, host2Id });
+
+      const receiverUser = await User.findById(host2Id).select("_id isPushNotificationEnabled isBlock fcmToken").lean();
+
+      if (receiverUser && receiverUser.isPushNotificationEnabled && !receiverUser.isBlock && receiverUser.fcmToken) {
+        const adminPromise = await admin;
+        adminPromise
+          .messaging()
+          .send({
+            token: receiverUser.fcmToken,
+            data: { type: "PK_REQUEST_CANCELLED", host1Id, host2Id }, //data-only: the app only needs to dismiss the dialog
+          })
+          .then((response) => console.log("[pkCancelRequest] Notification sent:", response))
+          .catch((error) => console.error("[pkCancelRequest] Error sending notification:", error));
+      }
+    } catch (error) {
+      console.error("Error in pkCancelRequest:", error);
+    }
+  });
+
   socket.on("pkAnswer", async (data) => {
-    const parseData = JSON.parse(data);
-    console.log("Received pkAnswer event with data:", parseData);
+    try {
+      const parseData = JSON.parse(data);
+      console.log("Received pkAnswer event with data:", parseData);
 
-    const [user1, user2, liveStreamer1, liveStreamer2] = await Promise.all([
-      User.findById(parseData.HOST_1_ID)
-        .select("_id name userName coin image isProfilePicBanned isVerified gender age countryFlagImage country uniqueId isPushNotificationEnabled isBlock fcmToken")
-        .lean(),
-      User.findById(parseData.HOST_2_ID)
-        .select("_id name userName coin image isProfilePicBanned isVerified gender age countryFlagImage country uniqueId isPushNotificationEnabled isBlock fcmToken")
-        .lean(),
-      LiveStreamer.findOne({ userId: parseData.HOST_1_ID }).select("tencentRoomId tencentUserId").lean(),
-      LiveStreamer.findOne({ userId: parseData.HOST_2_ID }).select("tencentRoomId tencentUserId").lean(),
-    ]);
-
-    if (!user1) {
-      console.log("Host 1 is Not Found");
-      io.in("globalRoom:" + parseData.HOST_1_ID).emit("pkAnswer", "Host 1 is Not Found");
-    }
-
-    if (!user2) {
-      console.log("Host 2 is Not Found");
-      io.in("globalRoom:" + parseData.HOST_2_ID).emit("pkAnswer", "Host 2 is Not Found");
-    }
-
-    if (parseData.isAccept) {
-      console.log("PK Accepted for", parseData.HOST_1_ID, "and", parseData.HOST_2_ID);
-
-      const pkId = Math.floor(Math.random() * 10000000) + 99999999;
-
-      let pkTime = settingJSON.pkEndTime ? settingJSON.pkEndTime : 300;
-      const endTime = new Date(Date.now() + pkTime * 1000);
-
-      var duration = Math.round((endTime - new Date().getTime()) / 1000);
-      if (duration < 0) duration = 0;
-
-      const host1Details = {
-        ...user1,
-        wealthLevelImage: parseData.HOST_1_WEALTHLEVEL_IMAGE,
-        avtarFrameType: parseData.HOST_1_AVTAR_FRAME_TYPE,
-        avtarFrame: parseData.HOST_1_AVTAR_FRAME,
-      };
-      const host2Details = {
-        ...user2,
-        wealthLevelImage: parseData.HOST_2_WEALTHLEVEL_IMAGE,
-        avtarFrameType: parseData.HOST_2_AVTAR_FRAME_TYPE,
-        avtarFrame: parseData.HOST_2_AVTAR_FRAME,
-      };
-
-      const [liveUser1, liveUser2] = await Promise.all([
-        LiveStreamer.findOneAndUpdate(
-          {
-            userId: parseData.HOST_1_ID,
-            liveType: { $nin: [2, 3, 4] },
-          },
-          {
-            $set: {
-              isPkMode: true,
-              pkEndTime: endTime,
-              pkId: pkId,
-              "pkConfig.host1Id": parseData.HOST_1_ID,
-              "pkConfig.host1Name": parseData.HOST_1_NAME,
-              "pkConfig.host1Image": parseData.HOST_1_IMAGE,
-              "pkConfig.host1UniqueId": parseData.HOST_1_UNIQUEID,
-              "pkConfig.host1ObjId": parseData.HOST_1_LIVEUSER_OBJ_ID,
-              "pkConfig.host1LiveId": parseData.HOST_1_LIVEID,
-              "pkConfig.host1Channel": parseData.HOST_1_CHANNEL,
-              "pkConfig.host1AgoraUID": parseData.HOST_1_AGORA_ID,
-              "pkConfig.host1TencentUserId": liveStreamer1?.tencentUserId || "",
-              "pkConfig.host1TencentRoomId": liveStreamer1?.tencentRoomId || "",
-
-              "pkConfig.host2Id": parseData.HOST_2_ID,
-              "pkConfig.host2Name": parseData.HOST_2_NAME,
-              "pkConfig.host2userName": parseData.HOST_2_USERNAME,
-              "pkConfig.host2Image": parseData.HOST_2_IMAGE,
-              "pkConfig.host2UniqueId": parseData.HOST_2_UNIQUEID,
-              "pkConfig.host2ObjId": parseData.HOST_2_LIVEUSER_OBJ_ID,
-              "pkConfig.host2LiveId": parseData.HOST_2_LIVEID,
-              "pkConfig.host2Channel": parseData.HOST_2_CHANNEL,
-              "pkConfig.host2AgoraUID": parseData.HOST_2_AGORA_ID,
-              "pkConfig.host2TencentUserId": liveStreamer2?.tencentUserId || "",
-              "pkConfig.host2TencentRoomId": liveStreamer2?.tencentRoomId || "",
-
-              "pkConfig.host1Details": host1Details,
-              "pkConfig.host2Details": host2Details,
-            },
-          },
-          { new: true, lean: true },
-        ),
-        LiveStreamer.findOneAndUpdate(
-          {
-            userId: parseData.HOST_2_ID,
-            liveType: { $nin: [2, 3, 4] },
-          },
-          {
-            $set: {
-              isPkMode: true,
-              pkEndTime: endTime,
-              pkId: pkId,
-              "pkConfig.host1Id": parseData.HOST_2_ID,
-              "pkConfig.host1Name": parseData.HOST_2_NAME,
-              "pkConfig.host1Image": parseData.HOST_2_IMAGE,
-              "pkConfig.host1UniqueId": parseData.HOST_2_UNIQUEID,
-              "pkConfig.host1ObjId": parseData.HOST_2_LIVEUSER_OBJ_ID,
-              "pkConfig.host1LiveId": parseData.HOST_2_LIVEID,
-              "pkConfig.host1Channel": parseData.HOST_2_CHANNEL,
-              "pkConfig.host1AgoraUID": parseData.HOST_2_AGORA_ID,
-              "pkConfig.host1TencentUserId": liveStreamer2?.tencentUserId || "",
-              "pkConfig.host1TencentRoomId": liveStreamer2?.tencentRoomId || "",
-
-              "pkConfig.host2Id": parseData.HOST_1_ID,
-              "pkConfig.host2Name": parseData.HOST_1_NAME,
-              "pkConfig.host2userName": parseData.HOST_1_USERNAME,
-              "pkConfig.host2Image": parseData.HOST_1_IMAGE,
-              "pkConfig.host2UniqueId": parseData.HOST_1_UNIQUEID,
-              "pkConfig.host2ObjId": parseData.HOST_1_LIVEUSER_OBJ_ID,
-              "pkConfig.host2LiveId": parseData.HOST_1_LIVEID,
-              "pkConfig.host2Channel": parseData.HOST_1_CHANNEL,
-              "pkConfig.host2AgoraUID": parseData.HOST_1_AGORA_ID,
-              "pkConfig.host2TencentUserId": liveStreamer1?.tencentUserId || "",
-              "pkConfig.host2TencentRoomId": liveStreamer1?.tencentRoomId || "",
-
-              "pkConfig.host1Details": host2Details,
-              "pkConfig.host2Details": host1Details,
-            },
-          },
-          { new: true, lean: true },
-        ),
+      const [user1, user2, liveStreamer1, liveStreamer2] = await Promise.all([
+        User.findById(parseData.HOST_1_ID)
+          .select("_id name userName coin image isProfilePicBanned isVerified gender age countryFlagImage country uniqueId isPushNotificationEnabled isBlock fcmToken")
+          .lean(),
+        User.findById(parseData.HOST_2_ID)
+          .select("_id name userName coin image isProfilePicBanned isVerified gender age countryFlagImage country uniqueId isPushNotificationEnabled isBlock fcmToken")
+          .lean(),
+        LiveStreamer.findOne({ userId: parseData.HOST_1_ID }).select("tencentRoomId tencentUserId").lean(),
+        LiveStreamer.findOne({ userId: parseData.HOST_2_ID }).select("tencentRoomId tencentUserId").lean(),
       ]);
 
-      if (!liveUser1 || !liveUser2) {
-        socket.emit("singleLiveUserResponse", "PK Mode initiation failed: One or both hosts are either not live or using an unsupported liveType.");
+      if (!user1) {
+        console.log("Host 1 is Not Found");
+        io.in("globalRoom:" + parseData.HOST_1_ID).emit("pkAnswer", "Host 1 is Not Found");
+      }
 
-        console.log("PK Mode initiation failed: One or both hosts are either not live or using an unsupported liveType.");
+      if (!user2) {
+        console.log("Host 2 is Not Found");
+        io.in("globalRoom:" + parseData.HOST_2_ID).emit("pkAnswer", "Host 2 is Not Found");
+      }
+
+      if (parseData.isAccept) {
+        console.log("PK Accepted for", parseData.HOST_1_ID, "and", parseData.HOST_2_ID);
+
+        const pkId = Math.floor(Math.random() * 10000000) + 99999999;
+
+        const host1Details = {
+          ...user1,
+          wealthLevelImage: parseData.HOST_1_WEALTHLEVEL_IMAGE,
+          avtarFrameType: parseData.HOST_1_AVTAR_FRAME_TYPE,
+          avtarFrame: parseData.HOST_1_AVTAR_FRAME,
+        };
+        const host2Details = {
+          ...user2,
+          wealthLevelImage: parseData.HOST_2_WEALTHLEVEL_IMAGE,
+          avtarFrameType: parseData.HOST_2_AVTAR_FRAME_TYPE,
+          avtarFrame: parseData.HOST_2_AVTAR_FRAME,
+        };
+
+        const hostA = {
+          id: parseData.HOST_1_ID,
+          name: parseData.HOST_1_NAME,
+          userName: parseData.HOST_1_USERNAME,
+          image: parseData.HOST_1_IMAGE,
+          uniqueId: parseData.HOST_1_UNIQUEID,
+          liveObjId: parseData.HOST_1_LIVEUSER_OBJ_ID,
+          liveHistoryId: parseData.HOST_1_LIVEID,
+          channel: parseData.HOST_1_CHANNEL,
+          agoraUid: parseData.HOST_1_AGORA_ID,
+          tencentUserId: liveStreamer1?.tencentUserId || "",
+          tencentRoomId: liveStreamer1?.tencentRoomId || "",
+          details: host1Details,
+        };
+
+        const hostB = {
+          id: parseData.HOST_2_ID,
+          name: parseData.HOST_2_NAME,
+          userName: parseData.HOST_2_USERNAME,
+          image: parseData.HOST_2_IMAGE,
+          uniqueId: parseData.HOST_2_UNIQUEID,
+          liveObjId: parseData.HOST_2_LIVEUSER_OBJ_ID,
+          liveHistoryId: parseData.HOST_2_LIVEID,
+          channel: parseData.HOST_2_CHANNEL,
+          agoraUid: parseData.HOST_2_AGORA_ID,
+          tencentUserId: liveStreamer2?.tencentUserId || "",
+          tencentRoomId: liveStreamer2?.tencentRoomId || "",
+          details: host2Details,
+        };
+
+        //Both hosts enter the lobby (pkStatus "lobby", no timer). A round starts via pkStartRequest / pkStartAnswer.
+        const session = await createPkSession({ pkId, hosts: [hostA, hostB] });
+
+        if (!session) {
+          socket.emit("singleLiveUserResponse", "PK Mode initiation failed: One or both hosts are either not live, already in a PK session, or using an unsupported liveType.");
+
+          console.log("PK Mode initiation failed: One or both hosts are either not live, already in a PK session, or using an unsupported liveType.");
+          return;
+        }
+
+        const [liveUser1, liveUser2] = session;
+        const [responseForUser1, responseForUser2] = await Promise.all([buildPkPayload(liveUser1), buildPkPayload(liveUser2)]);
+
+        //Each live room receives its own document (duration 0 while in the lobby)
+        io.in(parseData.HOST_1_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: responseForUser1 });
+        io.in(parseData.HOST_2_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: responseForUser2 });
+
+        if (user1 && user2) {
+          const isBlocked = await Block.exists({
+            $or: [
+              { userId: parseData.HOST_1_ID, toUserId: parseData.HOST_2_ID },
+              { userId: parseData.HOST_2_ID, toUserId: parseData.HOST_1_ID },
+            ],
+          });
+
+          if (!isBlocked && user1.isPushNotificationEnabled && !user1.isBlock && user1.fcmToken !== null) {
+            const host2Name = parseData.HOST_2_NAME?.trim() || user2?.name?.trim() || user2?.userName?.trim() || "The host";
+            const payload = {
+              token: user1.fcmToken,
+              notification: {
+                title: "⚔️ PK Accepted!",
+                body: `🏆 ${host2Name} accepted your PK challenge! You are both in the PK lobby, press Start PK when ready 🔥🎬`,
+              },
+              data: {
+                type: "PK_ACCEPTED",
+                host1Id: String(parseData.HOST_1_ID),
+                host2Id: String(parseData.HOST_2_ID),
+                pkId: String(pkId),
+                host1LiveUserObjId: String(parseData.HOST_1_LIVEUSER_OBJ_ID || ""),
+                host2LiveUserObjId: String(parseData.HOST_2_LIVEUSER_OBJ_ID || ""),
+                host2Name: String(host2Name),
+                host2Image: String(parseData.HOST_2_IMAGE || user2?.image || ""),
+              },
+            };
+
+            const adminPromise = await admin;
+            adminPromise
+              .messaging()
+              .send(payload)
+              .then((response) => {
+                console.log("[pkAnswer] PK accepted notification sent:", response);
+              })
+              .catch((error) => {
+                console.error("[pkAnswer] Error sending PK accepted notification:", error);
+              });
+          }
+        }
+      } else {
+        console.log("PK Rejected for", parseData.HOST_1_ID);
+
+        io.in(parseData.HOST_1_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: {} });
+        io.in(parseData.HOST_2_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: {} });
+
+        if (user1 && user2) {
+          const isBlocked = await Block.exists({
+            $or: [
+              { userId: parseData.HOST_1_ID, toUserId: parseData.HOST_2_ID },
+              { userId: parseData.HOST_2_ID, toUserId: parseData.HOST_1_ID },
+            ],
+          });
+
+          const answererId = id?.toString();
+          const host1IdStr = String(parseData.HOST_1_ID);
+          const host2IdStr = String(parseData.HOST_2_ID);
+          const isHost1Answerer = answererId === host1IdStr;
+          const notifyUser = isHost1Answerer ? user2 : user1;
+          const declinerUser = isHost1Answerer ? user1 : user2;
+          const declinerName = (isHost1Answerer ? parseData.HOST_1_NAME : parseData.HOST_2_NAME)?.trim() || declinerUser?.name?.trim() || declinerUser?.userName?.trim() || "The host";
+          const declinerImage = (isHost1Answerer ? parseData.HOST_1_IMAGE : parseData.HOST_2_IMAGE) || declinerUser?.image || "";
+
+          if (!isBlocked && notifyUser.isPushNotificationEnabled && !notifyUser.isBlock && notifyUser.fcmToken !== null) {
+            const payload = {
+              token: notifyUser.fcmToken,
+              notification: {
+                title: "😔⚔️ PK Declined",
+                body: `🎥 ${declinerName} declined your PK challenge. Try another host! 🔄💪`,
+              },
+              data: {
+                type: "PK_REJECTED",
+                host1Id: host1IdStr,
+                host2Id: host2IdStr,
+                host1LiveUserObjId: String(parseData.HOST_1_LIVEUSER_OBJ_ID || ""),
+                host2LiveUserObjId: String(parseData.HOST_2_LIVEUSER_OBJ_ID || ""),
+                host2Name: String(declinerName),
+                host2Image: String(declinerImage),
+              },
+            };
+
+            const adminPromise = await admin;
+            adminPromise
+              .messaging()
+              .send(payload)
+              .then((response) => {
+                console.log("[pkAnswer] PK rejected notification sent:", response);
+              })
+              .catch((error) => {
+                console.error("[pkAnswer] Error sending PK rejected notification:", error);
+              });
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error in pkAnswer:", error);
+    }
+  });
+
+  //pk: a host asks to start a round while in the lobby. The opponent must accept via pkStartAnswer.
+  socket.on("pkStartRequest", async (data) => {
+    try {
+      const parsedData = JSON.parse(data);
+      const pkId = parsedData?.pkId;
+      console.log("[pkStartRequest] Received data:", parsedData, "from:", id);
+
+      const session = await getSessionForHost(pkId, id);
+      if (!session) {
+        return socket.emit("pkError", { event: "pkStartRequest", message: "You are not a host of this PK session." });
+      }
+
+      const { ownDoc, opponentDoc } = session;
+
+      if (ownDoc.pkStatus !== PK_STATUS.LOBBY) {
+        return socket.emit("pkError", { event: "pkStartRequest", message: "A round is already running." });
+      }
+
+      if (!opponentDoc) {
+        await endPkSession(pkId, { reason: "partner_missing", endedBy: id });
+        return socket.emit("pkError", { event: "pkStartRequest", message: "Your opponent is no longer live." });
+      }
+
+      const opponentId = opponentDoc.userId.toString();
+      const pendingBy = ownDoc.pkStartRequestedBy ? ownDoc.pkStartRequestedBy.toString() : "";
+
+      //Both hosts pressed Start: mutual consent, start right away
+      if (pendingBy && pendingBy === opponentId) {
+        const started = await startPkRound(pkId, { startedBy: id });
+        if (!started) socket.emit("pkError", { event: "pkStartRequest", message: "Round could not be started." });
         return;
       }
 
-      const [responseForUser1, responseForUser2] = await Promise.all([
-        LiveStreamer.aggregate([
-          { $match: { _id: liveUser2?._id } },
-          { $addFields: { duration } },
-          {
-            $project: {
-              userId: 1,
-              name: 1,
-              token: 1,
-              channel: 1,
-              coin: 1,
-              duration: 1,
-              isPkMode: 1,
-              pkConfig: 1,
-              liveHistoryId: 1,
-              view: 1,
-              tencentRoomId: 1,
-              tencentUserId: 1,
-              tencent: {
-                roomId: { $ifNull: ["$tencentRoomId", ""] },
-                odcUserId: { $toString: "$userId" },
-              },
-            },
-          },
-        ]),
-        LiveStreamer.aggregate([
-          { $match: { _id: liveUser1?._id } },
-          { $addFields: { duration } },
-          {
-            $project: {
-              userId: 1,
-              name: 1,
-              token: 1,
-              channel: 1,
-              coin: 1,
-              duration: 1,
-              isPkMode: 1,
-              pkConfig: 1,
-              liveHistoryId: 1,
-              view: 1,
-              tencentRoomId: 1,
-              tencentUserId: 1,
-              tencent: {
-                roomId: { $ifNull: ["$tencentRoomId", ""] },
-                odcUserId: { $toString: "$userId" },
-              },
-            },
-          },
-        ]),
-      ]);
+      await setStartRequest(pkId, id);
 
-      io.in(parseData.HOST_1_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: responseForUser2[0] });
-      io.in(parseData.HOST_2_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: responseForUser1[0] });
+      io.in("globalRoom:" + opponentId).emit("pkStartRequested", {
+        pkId: String(pkId),
+        requestedBy: id,
+        name: ownDoc.pkConfig?.host1Name || "",
+        image: ownDoc.pkConfig?.host1Image || "",
+      });
+    } catch (error) {
+      console.error("Error in pkStartRequest:", error);
+    }
+  });
 
-      await Promise.all([
-        liveUser1?.liveHistoryId
-          ? LiveStreamerHistory.updateOne(
-              { _id: liveUser1.liveHistoryId },
-              {
-                $set: {
-                  isPkMode: true,
-                  pkId: pkId,
-                  pkEndTime: endTime,
-                },
-              },
-            )
-          : Promise.resolve(),
-        liveUser2?.liveHistoryId
-          ? LiveStreamerHistory.updateOne(
-              { _id: liveUser2.liveHistoryId },
-              {
-                $set: {
-                  isPkMode: true,
-                  pkId: pkId,
-                  pkEndTime: endTime,
-                },
-              },
-            )
-          : Promise.resolve(),
-      ]);
+  //pk: the opponent accepts or rejects a pending start request
+  socket.on("pkStartAnswer", async (data) => {
+    try {
+      const parsedData = JSON.parse(data);
+      const pkId = parsedData?.pkId;
+      const isAccept = !!parsedData?.isAccept;
+      console.log("[pkStartAnswer] Received data:", parsedData, "from:", id);
 
-      if (user1 && user2) {
-        const isBlocked = await Block.exists({
-          $or: [
-            { userId: parseData.HOST_1_ID, toUserId: parseData.HOST_2_ID },
-            { userId: parseData.HOST_2_ID, toUserId: parseData.HOST_1_ID },
-          ],
-        });
-
-        if (!isBlocked && user1.isPushNotificationEnabled && !user1.isBlock && user1.fcmToken !== null) {
-          const host2Name = parseData.HOST_2_NAME?.trim() || user2?.name?.trim() || user2?.userName?.trim() || "The host";
-          const payload = {
-            token: user1.fcmToken,
-            notification: {
-              title: "⚔️ PK Accepted!",
-              body: `🏆 ${host2Name} accepted your PK challenge! The battle starts now 🔥🎬`,
-            },
-            data: {
-              type: "PK_ACCEPTED",
-              host1Id: String(parseData.HOST_1_ID),
-              host2Id: String(parseData.HOST_2_ID),
-              pkId: String(pkId),
-              host1LiveUserObjId: String(parseData.HOST_1_LIVEUSER_OBJ_ID || ""),
-              host2LiveUserObjId: String(parseData.HOST_2_LIVEUSER_OBJ_ID || ""),
-              host2Name: String(host2Name),
-              host2Image: String(parseData.HOST_2_IMAGE || user2?.image || ""),
-            },
-          };
-
-          const adminPromise = await admin;
-          adminPromise
-            .messaging()
-            .send(payload)
-            .then((response) => {
-              console.log("[pkAnswer] PK accepted notification sent:", response);
-            })
-            .catch((error) => {
-              console.error("[pkAnswer] Error sending PK accepted notification:", error);
-            });
-        }
+      const session = await getSessionForHost(pkId, id);
+      if (!session) {
+        return socket.emit("pkError", { event: "pkStartAnswer", message: "You are not a host of this PK session." });
       }
-    } else {
-      console.log("PK Rejected for", parseData.HOST_1_ID);
 
-      io.in(parseData.HOST_1_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: {} });
-      io.in(parseData.HOST_2_LIVEUSER_OBJ_ID).emit("pkAnswer", { data, response: {} });
+      const { ownDoc, opponentDoc } = session;
 
-      if (user1 && user2) {
-        const isBlocked = await Block.exists({
-          $or: [
-            { userId: parseData.HOST_1_ID, toUserId: parseData.HOST_2_ID },
-            { userId: parseData.HOST_2_ID, toUserId: parseData.HOST_1_ID },
-          ],
-        });
-
-        const answererId = id?.toString();
-        const host1IdStr = String(parseData.HOST_1_ID);
-        const host2IdStr = String(parseData.HOST_2_ID);
-        const isHost1Answerer = answererId === host1IdStr;
-        const notifyUser = isHost1Answerer ? user2 : user1;
-        const declinerUser = isHost1Answerer ? user1 : user2;
-        const declinerName = (isHost1Answerer ? parseData.HOST_1_NAME : parseData.HOST_2_NAME)?.trim() || declinerUser?.name?.trim() || declinerUser?.userName?.trim() || "The host";
-        const declinerImage = (isHost1Answerer ? parseData.HOST_1_IMAGE : parseData.HOST_2_IMAGE) || declinerUser?.image || "";
-
-        if (!isBlocked && notifyUser.isPushNotificationEnabled && !notifyUser.isBlock && notifyUser.fcmToken !== null) {
-          const payload = {
-            token: notifyUser.fcmToken,
-            notification: {
-              title: "😔⚔️ PK Declined",
-              body: `🎥 ${declinerName} declined your PK challenge. Try another host! 🔄💪`,
-            },
-            data: {
-              type: "PK_REJECTED",
-              host1Id: host1IdStr,
-              host2Id: host2IdStr,
-              host1LiveUserObjId: String(parseData.HOST_1_LIVEUSER_OBJ_ID || ""),
-              host2LiveUserObjId: String(parseData.HOST_2_LIVEUSER_OBJ_ID || ""),
-              host2Name: String(declinerName),
-              host2Image: String(declinerImage),
-            },
-          };
-
-          const adminPromise = await admin;
-          adminPromise
-            .messaging()
-            .send(payload)
-            .then((response) => {
-              console.log("[pkAnswer] PK rejected notification sent:", response);
-            })
-            .catch((error) => {
-              console.error("[pkAnswer] Error sending PK rejected notification:", error);
-            });
-        }
+      if (ownDoc.pkStatus !== PK_STATUS.LOBBY) {
+        return socket.emit("pkError", { event: "pkStartAnswer", message: "A round is already running." });
       }
+
+      const pendingBy = ownDoc.pkStartRequestedBy ? ownDoc.pkStartRequestedBy.toString() : "";
+      if (!opponentDoc || !pendingBy || pendingBy !== opponentDoc.userId.toString()) {
+        return socket.emit("pkError", { event: "pkStartAnswer", message: "No pending start request from your opponent." });
+      }
+
+      if (!isAccept) {
+        await setStartRequest(pkId, null);
+        io.in("globalRoom:" + pendingBy).emit("pkStartRejected", { pkId: String(pkId), rejectedBy: id });
+        return;
+      }
+
+      const started = await startPkRound(pkId, { startedBy: pendingBy });
+      if (!started) socket.emit("pkError", { event: "pkStartAnswer", message: "Round could not be started." });
+    } catch (error) {
+      console.error("Error in pkStartAnswer:", error);
+    }
+  });
+
+  //pk: end the current round only; both hosts return to the lobby of the same session
+  socket.on("pkEndRound", async (data) => {
+    try {
+      const parsedData = JSON.parse(data);
+      const pkId = parsedData?.pkId;
+      console.log("[pkEndRound] Received data:", parsedData, "from:", id);
+
+      const session = await getSessionForHost(pkId, id);
+      if (!session) {
+        return socket.emit("pkError", { event: "pkEndRound", message: "You are not a host of this PK session." });
+      }
+
+      if (session.ownDoc.pkStatus !== PK_STATUS.ROUND) {
+        return socket.emit("pkError", { event: "pkEndRound", message: "No round is running." });
+      }
+
+      const ended = await endPkRound(pkId, { reason: "manual", endedBy: id });
+      if (!ended) socket.emit("pkError", { event: "pkEndRound", message: "Round already ended." });
+    } catch (error) {
+      console.error("Error in pkEndRound:", error);
+    }
+  });
+
+  //pk: end the whole session (lobby or mid-round); both hosts return to their solo lives
+  socket.on("pkEndSession", async (data) => {
+    try {
+      const parsedData = JSON.parse(data);
+      const pkId = parsedData?.pkId;
+      console.log("[pkEndSession] Received data:", parsedData, "from:", id);
+
+      const session = await getSessionForHost(pkId, id);
+      if (!session) {
+        return socket.emit("pkError", { event: "pkEndSession", message: "You are not a host of this PK session." });
+      }
+
+      const ended = await endPkSession(pkId, { reason: "manual", endedBy: id, legacyPkEnd: { isManualMode: false, pkEndUserId: id } });
+      if (!ended) socket.emit("pkError", { event: "pkEndSession", message: "Session already ended." });
+    } catch (error) {
+      console.error("Error in pkEndSession:", error);
     }
   });
 
@@ -3793,7 +3864,7 @@ io.on("connection", async (socket) => {
       Gift.findById(giftData.giftId).select("coin title image").lean(),
       User.findById(giftData.senderUserId).select("coin").lean(),
       User.findById(giftData.receiverUserId).select("_id coin role agencyId isBlock isHostBlocked").lean(),
-      LiveStreamer.findOne({ userId: giftData.receiverUserId, isPkMode: true }).select("liveHistoryId pkConfig pkEndTime").lean(),
+      LiveStreamer.findOne({ userId: giftData.receiverUserId, isPkMode: true }).select("liveHistoryId pkConfig pkEndTime pkId pkStatus").lean(),
     ]);
 
     if (!giftCategory) {
@@ -3842,8 +3913,8 @@ io.on("connection", async (socket) => {
       let receiverCoin = totalCoin - adminCoin;
 
       const [liveUser1, liveUser2, existing] = await Promise.all([
-        LiveStreamer.findOne({ userId: receiverPkLiveUser.pkConfig.host1Id, isPkMode: true }).select("pkConfig pkEndTime").lean(), //same as receiverPkLiveUser
-        LiveStreamer.findOne({ userId: receiverPkLiveUser.pkConfig.host2Id, isPkMode: true }).select("pkConfig").lean(),
+        LiveStreamer.findOne({ userId: receiverPkLiveUser.pkConfig.host1Id, isPkMode: true, pkId: receiverPkLiveUser.pkId }).select("pkConfig pkEndTime pkStatus").lean(), //same as receiverPkLiveUser
+        LiveStreamer.findOne({ userId: receiverPkLiveUser.pkConfig.host2Id, isPkMode: true, pkId: receiverPkLiveUser.pkId }).select("pkConfig pkEndTime pkStatus").lean(),
         TopGifter.findOneAndUpdate(
           {
             liveHistoryId: receiverPkLiveUser.liveHistoryId,
@@ -3858,93 +3929,49 @@ io.on("connection", async (socket) => {
         ),
       ]);
 
-      const updatePromises = [];
+      //Scores only move while a round is running (lobby gifts still pay out below, but are not counted)
+      const roundFilter = { pkId: receiverPkLiveUser.pkId, pkStatus: PK_STATUS.ROUND, pkEndTime: { $gt: new Date() } };
 
-      if (liveUser1) {
-        updatePromises.push(
-          LiveStreamer.updateOne(
-            { _id: liveUser1._id },
-            {
-              $inc: {
-                "pkConfig.localRank": totalCoin,
-                "pkConfig.localGiftCount": giftCount,
-                "pkConfig.host1Details.coin": totalCoin,
+      const [rankResult1] = await Promise.all([
+        liveUser1
+          ? LiveStreamer.updateOne(
+              { _id: liveUser1._id, ...roundFilter },
+              {
+                $inc: {
+                  "pkConfig.localRank": totalCoin,
+                  "pkConfig.localGiftCount": giftCount,
+                  "pkConfig.host1Details.coin": totalCoin,
+                },
               },
-            },
-          ),
-        );
-      }
-
-      if (liveUser2) {
-        updatePromises.push(
-          LiveStreamer.updateOne(
-            { _id: liveUser2._id },
-            {
-              $inc: {
-                "pkConfig.remoteRank": totalCoin,
-                "pkConfig.remoteGiftCount": giftCount,
-                "pkConfig.host2Details.coin": totalCoin,
+            )
+          : Promise.resolve(null),
+        liveUser2
+          ? LiveStreamer.updateOne(
+              { _id: liveUser2._id, ...roundFilter },
+              {
+                $inc: {
+                  "pkConfig.remoteRank": totalCoin,
+                  "pkConfig.remoteGiftCount": giftCount,
+                  "pkConfig.host2Details.coin": totalCoin,
+                },
               },
-            },
-          ),
-        );
-      }
-
-      await Promise.all(updatePromises);
-
-      var duration = Math.round((new Date(liveUser1?.pkEndTime).getTime() - new Date().getTime()) / 1000);
-      if (duration < 0) duration = 0;
-
-      const [responseForUser1, responseForUser2] = await Promise.all([
-        LiveStreamer.aggregate([
-          { $match: { _id: liveUser2?._id } },
-          { $addFields: { duration } },
-          {
-            $project: {
-              _id: 1,
-              userId: 1,
-              duration: 1,
-              pkConfig: 1,
-            },
-          },
-        ]),
-        LiveStreamer.aggregate([
-          { $match: { _id: liveUser1?._id } },
-          { $addFields: { duration } },
-          {
-            $project: {
-              _id: 1,
-              userId: 1,
-              duration: 1,
-              pkConfig: 1,
-            },
-          },
-        ]),
+            )
+          : Promise.resolve(null),
       ]);
 
-      const liveUser1Listen = {
-        giftData: giftData,
-        response: responseForUser2[0],
-      };
+      const counted = !!(rankResult1 && rankResult1.matchedCount > 0);
+      console.log(`[pkGift] pkId=${receiverPkLiveUser.pkId} status=${receiverPkLiveUser.pkStatus} counted=${counted}`);
 
+      const [responseForUser1, responseForUser2] = await Promise.all([buildPkPayload(liveUser1), buildPkPayload(liveUser2)]);
+
+      //Each live room receives its own document
       if (liveUser1) {
-        io.in(liveUser1._id.toString()).emit("pkGift", liveUser1Listen);
+        io.in(liveUser1._id.toString()).emit("pkGift", { giftData: giftData, response: responseForUser1, counted });
       }
-
-      const liveUser2Listen = {
-        giftData: giftData,
-        response: responseForUser1[0],
-      };
 
       if (liveUser2) {
-        io.in(liveUser2._id.toString()).emit("pkGift", liveUser2Listen);
+        io.in(liveUser2._id.toString()).emit("pkGift", { giftData: giftData, response: responseForUser2, counted });
       }
-
-      const roomHost1 = io.sockets.adapter.rooms.get(liveUser1._id.toString());
-      console.log("[pkGift] ROOM liveUser1: ", liveUser1._id.toString(), "Users:", roomHost1);
-
-      const roomHost2 = io.sockets.adapter.rooms.get(liveUser2._id.toString());
-      console.log("[pkGift] ROOM liveUser2: ", liveUser2._id.toString(), "Users:", roomHost2);
 
       if (!existing) {
         await TopGifter.findOneAndUpdate(
@@ -4188,227 +4215,33 @@ io.on("connection", async (socket) => {
     }
   });
 
+  //pk (legacy event): ends the whole session. The caller's live is no longer torn down here.
   socket.on("pkEnd", async (data) => {
     const parsedData = JSON.parse(data);
     console.log("[pkEnd] Event Triggered - Parsed Data:", parsedData);
 
     try {
-      const [user, liveUser, liveHistory] = await Promise.all([
-        User.findOne({ liveHistoryId: parsedData?.liveHistoryId }).select("_id isLive isBusy liveHistoryId").lean(),
-        LiveStreamer.findOne({
-          isPkMode: true,
-          isAudio: false,
-          userId: parsedData?.userId,
-          liveHistoryId: parsedData?.liveHistoryId,
-        })
-          .select("_id isPkMode pkConfig pkEndTime pkId")
-          .lean(),
-        LiveStreamerHistory.findById(parsedData?.liveHistoryId).select("_id startTime endTime duration"),
-      ]);
-
-      if (!user) {
-        console.error("[pkEnd] User not found.");
-        return;
-      }
+      const liveUser = await LiveStreamer.findOne({
+        isPkMode: true,
+        isAudio: false,
+        userId: parsedData?.userId,
+        liveHistoryId: parsedData?.liveHistoryId,
+      })
+        .select("_id pkId")
+        .lean();
 
       if (!liveUser) {
         console.log(`[pkEnd] No LiveUser found for userId: ${parsedData?.userId}, liveHistoryId: ${parsedData?.liveHistoryId}`);
         return;
       }
 
-      if (liveUser) {
-        console.log("[pkEnd] PK Mode Active - Ending PK...");
+      const ended = await endPkSession(liveUser.pkId, {
+        reason: "manual",
+        endedBy: parsedData?.userId,
+        legacyPkEnd: { isManualMode: parsedData?.isManualMode, pkEndUserId: parsedData?.pkEndUserId },
+      });
 
-        const roomHost1 = io.sockets.adapter.rooms.get(liveUser.pkConfig.host1ObjId);
-        console.log("[pkEnd] ROOM host1ObjId:", liveUser.pkConfig.host1ObjId, "Users:", roomHost1);
-
-        const roomHost2 = io.sockets.adapter.rooms.get(liveUser.pkConfig.host2ObjId);
-        console.log("[pkEnd] ROOM host2ObjId:", liveUser.pkConfig.host2ObjId, "Users:", roomHost2);
-
-        let winnerHost1 = 0;
-        let winnerHost2 = 0;
-
-        if (liveUser.pkConfig.localRank > liveUser.pkConfig.remoteRank) {
-          winnerHost1 = 2;
-          winnerHost2 = 1;
-        } else if (liveUser.pkConfig.localRank < liveUser.pkConfig.remoteRank) {
-          winnerHost1 = 1;
-          winnerHost2 = 2;
-        }
-
-        await Promise.all([
-          LiveStreamer.findOneAndUpdate({ _id: liveUser._id, isAudio: false }, { "pkConfig.isWinner": winnerHost1 }, { new: true, lean: true }),
-          LiveStreamer.findOneAndUpdate({ userId: liveUser.pkConfig.host2Id, isAudio: false }, { "pkConfig.isWinner": winnerHost2 }, { new: true, lean: true }),
-        ]);
-
-        const [responseForUser1, responseForUser2] = await Promise.all([
-          LiveStreamer.aggregate([
-            {
-              $match: {
-                userId: new mongoose.Types.ObjectId(liveUser.pkConfig.host2Id),
-                isAudio: false,
-              },
-            },
-            {
-              $project: {
-                _id: 1,
-                userId: 1,
-                name: 1,
-                userName: 1,
-                image: 1,
-                token: 1,
-                channel: 1,
-                duration: 1,
-                isPkMode: 1,
-                pkConfig: 1,
-                liveHistoryId: 1,
-                view: 1,
-              },
-            },
-          ]),
-          LiveStreamer.aggregate([
-            {
-              $match: {
-                userId: new mongoose.Types.ObjectId(liveUser.pkConfig.host1Id), //same as liveUser._id
-                isAudio: false,
-              },
-            },
-            {
-              $project: {
-                _id: 1,
-                userId: 1,
-                name: 1,
-                userName: 1,
-                image: 1,
-                token: 1,
-                channel: 1,
-                duration: 1,
-                isPkMode: 1,
-                pkConfig: 1,
-                liveHistoryId: 1,
-                view: 1,
-              },
-            },
-          ]),
-        ]);
-
-        io.in(liveUser.pkConfig.host1ObjId).emit("pkEnd", {
-          isManualMode: parsedData?.isManualMode,
-          pkEndUserId: parsedData?.pkEndUserId,
-          data: responseForUser2[0],
-          winner: responseForUser2[0]?.pkConfig.isWinner == 2 ? responseForUser2[0]?.pkConfig.host1Details : responseForUser2[0]?.pkConfig.host2Details,
-        });
-
-        io.in(liveUser.pkConfig.host2ObjId).emit("pkEnd", {
-          isManualMode: parsedData?.isManualMode,
-          pkEndUserId: parsedData?.pkEndUserId,
-          data: responseForUser1[0],
-          winner: responseForUser1[0]?.pkConfig.isWinner == 2 ? responseForUser1[0]?.pkConfig.host1Details : responseForUser1[0]?.pkConfig.host2Details,
-        });
-
-        if (parsedData.isManualMode) {
-          console.log("[pkEnd] Manual Mode Enabled - Updating History");
-
-          if (user.isLive && user.liveHistoryId && user.liveHistoryId !== null && liveHistory) {
-            console.log("[pkEnd] Cleaning Up Live Data");
-
-            liveHistory.endTime = moment().tz("Asia/Kolkata").format();
-
-            const start = moment.tz(liveHistory.startTime, "Asia/Kolkata");
-            const end = moment.tz(liveHistory.endTime, "Asia/Kolkata");
-            const duration = moment.utc(end.diff(start)).format("HH:mm:ss");
-            const durationInMinutes = Math.floor(moment.duration(end.diff(start)).asMinutes());
-
-            liveHistory.duration = duration;
-
-            await Promise.all([
-              liveHistory?.save(),
-              User.updateOne(
-                { _id: user._id },
-                {
-                  $set: {
-                    isLive: false,
-                    isBusy: false,
-                    liveHistoryId: null,
-                    liveStreamerId: null,
-                  },
-                },
-              ),
-              LiveStreamer.deleteOne({ isPkMode: true, userId: user._id, liveHistoryId: liveHistory._id }),
-              LiveStreamerView.deleteMany({ liveStreamerId: liveUser._id }),
-            ]);
-          }
-
-          const sockets = await io.in(parsedData?.liveHistoryId).fetchSockets();
-          console.log(`[pkEnd] Connected Sockets in Room ${parsedData?.liveHistoryId}: ${sockets.length}`);
-
-          if (sockets.length) io.socketsLeave(parsedData?.liveHistoryId);
-        }
-
-        await Promise.all([
-          LiveStreamer.updateMany(
-            { pkId: liveUser.pkId },
-            {
-              $set: {
-                isPkMode: false,
-                pkId: null,
-                pkEndTime: null,
-                "pkConfig.host1Id": null,
-                "pkConfig.host1Name": "",
-                "pkConfig.host1Image": "",
-                "pkConfig.host1UniqueId": "",
-                "pkConfig.host1LiveId": "",
-                "pkConfig.host1Channel": "",
-                "pkConfig.host1AgoraUID": 0,
-
-                "pkConfig.host2Id": null,
-                "pkConfig.host2Name": "",
-                "pkConfig.host2userName": "",
-                "pkConfig.host2Image": "",
-                "pkConfig.host2UniqueId": "",
-                "pkConfig.host2LiveId": "",
-                "pkConfig.host2Channel": "",
-                "pkConfig.host2AgoraUID": 0,
-
-                "pkConfig.localRank": 0,
-                "pkConfig.localGiftCount": 0,
-                "pkConfig.remoteRank": 0,
-                "pkConfig.remoteGiftCount": 0,
-                "pkConfig.isWinner": 0,
-
-                "pkConfig.host1Details.userId": null,
-                "pkConfig.host1Details.name": "",
-                "pkConfig.host1Details.userName": "",
-                "pkConfig.host1Details.image": "",
-                "pkConfig.host1Details.isProfilePicBanned": false,
-                "pkConfig.host1Details.isVerified": false,
-                "pkConfig.host1Details.gender": "",
-                "pkConfig.host1Details.age": 0,
-                "pkConfig.host1Details.countryFlagImage": "",
-                "pkConfig.host1Details.country": "",
-                "pkConfig.host1Details.uniqueId": "",
-                "pkConfig.host1Details.coin": 0,
-
-                "pkConfig.host2Details.userId": null,
-                "pkConfig.host2Details.name": "",
-                "pkConfig.host2Details.userName": "",
-                "pkConfig.host2Details.image": "",
-                "pkConfig.host1Details.isProfilePicBanned": false,
-                "pkConfig.host1Details.isVerified": false,
-                "pkConfig.host2Details.gender": "",
-                "pkConfig.host2Details.age": 0,
-                "pkConfig.host2Details.countryFlagImage": "",
-                "pkConfig.host2Details.country": "",
-                "pkConfig.host2Details.uniqueId": "",
-                "pkConfig.host2Details.coin": 0,
-              },
-            },
-            { new: true },
-          ),
-          TopGifter.deleteMany({ liveHistoryId: liveUser.pkConfig.host1LiveId }),
-          TopGifter.deleteMany({ liveHistoryId: liveUser.pkConfig.host2LiveId }),
-        ]);
-      }
+      if (!ended) console.log("[pkEnd] endPkSession found no active session for pkId:", liveUser.pkId);
     } catch (error) {
       console.error("Error in pkEnd:", error);
     }

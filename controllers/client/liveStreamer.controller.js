@@ -11,6 +11,7 @@ const User = require("../../models/user.model");
 const FollowerFollowing = require("../../models/followerFollowing.model");
 const FakeLiveStreamer = require("../../models/fakeLiveStreamer.model");
 const TopGifter = require("../../models/topGifter.model");
+const PkOpponent = require("../../models/pkOpponent.model");
 
 const admin = require("../../util/privateKey");
 const redis = require("../../util/redis");
@@ -18,6 +19,7 @@ const redis = require("../../util/redis");
 const fs = require("fs");
 
 const { deleteFile } = require("../../util/deletefile");
+const { getPkAvailability } = require("../../util/pkAvailability");
 
 const generateSessionId = async (userId) => {
   const lastSession = await LiveStreamerHistory.findOne({ userId }).sort({ createdAt: -1 }).select("sessionId").lean();
@@ -727,6 +729,10 @@ exports.fetchLiveStreamers = async (req, res) => {
           roomWelcome: 1,
           roomImage: 1,
           isPkMode: 1,
+          pkStatus: { $ifNull: ["$pkStatus", ""] },
+          pkRound: { $ifNull: ["$pkRound", 0] },
+          host1Wins: { $ifNull: ["$pkConfig.host1Wins", 0] },
+          host2Wins: { $ifNull: ["$pkConfig.host2Wins", 0] },
           userId: 1,
           bgTheme: 1,
           admins: {
@@ -758,8 +764,8 @@ exports.fetchLiveStreamers = async (req, res) => {
           host2userName: "$pkConfig.host2userName",
           host2Image: "$pkConfig.host2Image",
           host2isProfilePicBanned: "$pkConfig.host2Details.isProfilePicBanned",
-          host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", ""] },
-          host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrame", 0] },
+          host2AvtarFrame: { $ifNull: ["$pkConfig.host2Details.avtarFrame", ""] },
+          host2AvtarFrameType: { $ifNull: ["$pkConfig.host2Details.avtarFrameType", 0] },
           host2TencentRoomId: { $ifNull: ["$pkConfig.host2TencentRoomId", ""] },
           host2TencentUserId: { $ifNull: ["$pkConfig.host2TencentUserId", ""] },
           localRank: "$pkConfig.localRank",
@@ -864,6 +870,10 @@ exports.fetchLiveStreamers = async (req, res) => {
                 ],
               },
               isPkMode: { $eq: ["$streamType", 3] },
+              pkStatus: { $cond: [{ $eq: ["$streamType", 3] }, "round", ""] },
+              pkRound: { $literal: 0 },
+              host1Wins: { $literal: 0 },
+              host2Wins: { $literal: 0 },
               audioLiveType: { $literal: 0 },
               privateCode: { $literal: 0 },
               roomName: 1,
@@ -1087,6 +1097,7 @@ exports.getAvailableLiveUsers = async (req, res) => {
                 country: 1,
                 isVerified: 1,
                 activeAvtarFrame: 1,
+                uniqueId: 1,
               },
             },
           ],
@@ -1118,6 +1129,7 @@ exports.getAvailableLiveUsers = async (req, res) => {
           name: "$user.name",
           userName: "$user.userName",
           image: "$user.image",
+          uniqueId: "$user.uniqueId",
           isProfilePicBanned: "$user.isProfilePicBanned",
           countryFlagImage: "$user.countryFlagImage",
           country: "$user.country",
@@ -1607,5 +1619,82 @@ exports.fetchLiveCountries = async (req, res) => {
   } catch (error) {
     console.error("Fetch Countries Error:", error);
     return res.status(500).json({ status: false, message: error.message || "Internal Server Error" });
+  }
+};
+
+//search a host by uniqueId for a pk invitation ( pk battle )
+exports.searchPkHost = async (req, res) => {
+  try {
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ status: false, message: "Access denied. Please authenticate with a valid token." });
+    }
+
+    const uniqueId = req.query.uniqueId ? String(req.query.uniqueId).trim() : "";
+
+    if (!uniqueId) {
+      return res.status(200).json({ status: false, message: "uniqueId must be needed." });
+    }
+
+    const user = await User.findOne({ uniqueId }).select("_id").lean();
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    const availability = await getPkAvailability([user._id], { requesterId: req.user.userId });
+    const host = availability.get(String(user._id));
+
+    if (!host) {
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    return res.status(200).json({
+      status: true,
+      message: host.isAvailable ? "Host is available for PK." : "Host is not available for PK.",
+      data: host,
+    });
+  } catch (error) {
+    console.error("Error searching PK host:", error);
+    return res.status(500).json({ status: false, message: "Internal Server Error", error: error.message });
+  }
+};
+
+//recent pk opponents of the caller with live availability, for a one-tap rematch ( pk battle )
+exports.recentPkOpponents = async (req, res) => {
+  try {
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ status: false, message: "Access denied. Please authenticate with a valid token." });
+    }
+
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const userId = new mongoose.Types.ObjectId(req.user.userId);
+
+    const opponents = await PkOpponent.find({ userId })
+      .sort({ lastBattledAt: -1 })
+      .skip((start - 1) * limit)
+      .limit(limit)
+      .select("opponentId lastBattledAt battleCount")
+      .lean();
+
+    const availability = await getPkAvailability(
+      opponents.map((opponent) => opponent.opponentId),
+      { requesterId: req.user.userId },
+    );
+
+    const data = opponents.map((opponent) => ({
+      ...(availability.get(String(opponent.opponentId)) || { userId: opponent.opponentId, isAvailable: false, unavailableReason: "not_found" }),
+      lastBattledAt: opponent.lastBattledAt,
+      battleCount: opponent.battleCount,
+    }));
+
+    return res.status(200).json({
+      status: true,
+      message: data.length ? "Recent PK opponents retrieved successfully." : "No recent PK opponents.",
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching recent PK opponents:", error);
+    return res.status(500).json({ status: false, message: "Internal Server Error", error: error.message });
   }
 };

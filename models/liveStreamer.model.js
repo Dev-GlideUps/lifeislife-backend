@@ -23,8 +23,11 @@ const liveStreamerSchema = new mongoose.Schema(
     view: { type: Number, default: 0 },
     liveType: { type: Number, enum: [0, 1, 2, 3, 4], default: 0 }, //1.normal-live 2.audio-live 3.multi-live 4.call-join
 
-    isPkMode: { type: Boolean, default: false },
-    pkEndTime: { type: String, default: null },
+    isPkMode: { type: Boolean, default: false }, //true for the whole PK session (lobby + rounds)
+    pkStatus: { type: String, enum: ["", "lobby", "round", "ending"], default: "" }, //lobby: no round running, round: timer running
+    pkRound: { type: Number, default: 0 }, //rounds started in this session
+    pkEndTime: { type: Date, default: null }, //deadline of the current round, null in lobby
+    pkStartRequestedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }, //host with a pending "start round" request
     pkId: { type: String, default: null },
     pkConfig: {
       host1Id: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }, //user who started Pk
@@ -54,7 +57,9 @@ const liveStreamerSchema = new mongoose.Schema(
       localGiftCount: { type: Number, default: 0 },
       remoteRank: { type: Number, default: 0 },
       remoteGiftCount: { type: Number, default: 0 },
-      isWinner: { type: Number, enum: [0, 1, 2], default: 0 }, // 0: draw(tie), 1: loose, 2: winner
+      isWinner: { type: Number, enum: [0, 1, 2], default: 0 }, // 0: draw(tie), 1: loose, 2: winner (last finished round)
+      host1Wins: { type: Number, default: 0 }, //rounds won in this session by host1 (this host)
+      host2Wins: { type: Number, default: 0 }, //rounds won in this session by host2 (opponent)
 
       host1Details: {
         userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
@@ -200,5 +205,7 @@ liveStreamerSchema.index({ userId: 1 });
 liveStreamerSchema.index({ liveHistoryId: 1 });
 liveStreamerSchema.index({ createdAt: -1 });
 liveStreamerSchema.index({ liveType: 1, isAudio: 1, country: 1 });
+liveStreamerSchema.index({ pkId: 1 });
+liveStreamerSchema.index({ pkStatus: 1, pkEndTime: 1 }); //overdue-round sweep
 
 module.exports = mongoose.model("LiveStreamer", liveStreamerSchema);

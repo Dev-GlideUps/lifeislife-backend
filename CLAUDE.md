@@ -37,6 +37,7 @@ middleware exits at startup.
 |---|---|
 | Bootstrap, cron, game-provider callbacks | `index.js` |
 | All socket events (chat, live, audio seats, PK, calls, gifts) | `socket.js` (one big file; search `socket.on("<event>"`) |
+| PK session lifecycle (lobby, rounds, timer, reset) and host availability | `util/pkSession.js`, `util/pkAvailability.js` (see `docs/pk-battle.md`) |
 | URL → handler | `routes/<area>/route.js` → `routes/<area>/<feature>.route.js` → `controllers/<area>/<feature>.controller.js` |
 | Schemas | `models/*.model.js` (`user`, `liveStreamer`, `liveStreamerHistory`, `history` = wallet ledger, `setting`, `agency`, `payoutRequest`) |
 | Enums (history types, roles, login types…) | `types/constant.js` |
