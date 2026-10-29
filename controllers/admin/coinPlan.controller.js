@@ -8,16 +8,18 @@ const { HISTORY_TYPE } = require("../../types/constant");
 //create coinplan
 exports.storeCoinPlan = async (req, res) => {
   try {
-    if (!req.body.coin || !req.body.amount || !req.body.productKey) {
-      return res.status(200).json({ status: false, message: "Oops! Invalid details." });
+    if (!req.body.coin || !req.body.amount) {
+      return res.status(200).json({ status: false, message: "Oops! Invalid details. coin and amount are required." });
     }
 
-    const { coin, amount, productKey } = req.body;
+    const { coin, amount, productKey, androidProductKey, iosProductKey } = req.body;
 
     const coinplan = new CoinPlan({
       coin,
       amount,
-      productKey,
+      productKey: productKey || "", // Legacy field
+      androidProductKey: androidProductKey || productKey || "", // Use productKey as fallback
+      iosProductKey: iosProductKey || "",
     });
 
     await coinplan.save();
@@ -50,12 +52,14 @@ exports.updateCoinPlan = async (req, res) => {
     const updateFields = {
       coin: req.body.coin ? Number(req.body.coin) : coinplan.coin,
       amount: req.body.amount ? Number(req.body.amount) : coinplan.amount,
-      productKey: req.body.productKey ? req.body.productKey : coinplan.productKey,
+      productKey: req.body.productKey !== undefined ? req.body.productKey : coinplan.productKey,
+      androidProductKey: req.body.androidProductKey !== undefined ? req.body.androidProductKey : coinplan.androidProductKey,
+      iosProductKey: req.body.iosProductKey !== undefined ? req.body.iosProductKey : coinplan.iosProductKey,
     };
 
     const updatedCoinPlan = await CoinPlan.findByIdAndUpdate(coinPlanId, updateFields, {
       new: true,
-      select: "coin amount productKey",
+      select: "coin amount productKey androidProductKey iosProductKey",
       lean: true,
     });
 
@@ -126,7 +130,10 @@ exports.deleteCoinPlan = async (req, res) => {
 //get coinPlan
 exports.getCoinPlans = async (req, res) => {
   try {
-    const coinPlans = await CoinPlan.find().select("coin amount productKey isActive isPopular").sort({ coin: 1, amount: 1 }).lean();
+    const coinPlans = await CoinPlan.find()
+      .select("coin amount productKey androidProductKey iosProductKey isActive isPopular")
+      .sort({ coin: 1, amount: 1 })
+      .lean();
 
     return res.status(200).json({
       status: true,

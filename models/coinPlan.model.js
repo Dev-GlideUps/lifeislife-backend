@@ -4,7 +4,9 @@ const coinplanSchema = new mongoose.Schema(
   {
     coin: { type: Number, default: 0 },
     amount: { type: Number, default: 0 },
-    productKey: { type: String, default: "" },
+    productKey: { type: String, default: "" }, // Legacy - keep for backward compatibility
+    androidProductKey: { type: String, default: "" }, // Google Play product ID
+    iosProductKey: { type: String, default: "" }, // App Store product ID
     isPopular: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },
   },

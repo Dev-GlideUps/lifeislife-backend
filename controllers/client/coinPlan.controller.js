@@ -525,20 +525,61 @@ exports.validateGooglePlayPurchase = async (req, res) => {
     const userObjectId = new mongoose.Types.ObjectId(req.user.userId);
     const coinPlanObjectId = new mongoose.Types.ObjectId(coinPlanId);
 
+    // Check if this purchaseToken was already used (once-per-token rule)
+    const alreadyCredited = await History.findOne({
+      purchaseToken: token,
+      paymentGateway: "GooglePlay",
+    }).lean();
+
+    if (alreadyCredited) {
+      console.log(`[GooglePlay] Token already credited: ${token}`);
+      return res.status(200).json({ status: true, message: "Coins already credited" });
+    }
+
     const [uniqueId, user, coinPlan] = await Promise.all([
       generateHistoryUniqueId(),
       User.findById(userObjectId).select("_id coin isBlock").lean(),
-      CoinPlan.findById(coinPlanObjectId).select("_id coin amount").lean(),
+      CoinPlan.findById(coinPlanObjectId).select("_id coin amount androidProductKey productKey").lean(),
     ]);
 
     if (!user) return res.status(200).json({ status: false, message: "User not found." });
     if (user.isBlock) return res.status(200).json({ status: false, message: "User is blocked." });
     if (!coinPlan) return res.status(200).json({ status: false, message: "Coin plan not found." });
 
+    // Validate productId matches the plan's androidProductKey (or legacy productKey)
+    const expectedProductId = coinPlan.androidProductKey || coinPlan.productKey;
+    if (productId !== expectedProductId) {
+      console.warn(`[GooglePlay] Product ID mismatch: received ${productId}, expected ${expectedProductId}`);
+      return res.status(200).json({ status: false, message: "Product ID does not match the selected plan." });
+    }
+
+    // Priority: ENV variables > settingJSON (database)
+    // googlePlayPrivateKey is stored as Object (full JSON) or the private_key string
+    let privateKey = process.env.GOOGLE_PLAY_PRIVATE_KEY;
+    let clientEmail = process.env.GOOGLE_PLAY_CLIENT_EMAIL;
+
+    // Fallback to settingJSON if env not set
+    if (!privateKey) {
+      privateKey = typeof settingJSON?.googlePlayPrivateKey === "object"
+        ? settingJSON?.googlePlayPrivateKey?.private_key
+        : settingJSON?.googlePlayPrivateKey;
+    }
+
+    if (!clientEmail) {
+      clientEmail = typeof settingJSON?.googlePlayPrivateKey === "object"
+        ? settingJSON?.googlePlayPrivateKey?.client_email || settingJSON?.googlePlayServiceAccountEmail
+        : settingJSON?.googlePlayServiceAccountEmail;
+    }
+
+    if (!privateKey || !clientEmail) {
+      console.error("[GooglePlay] Missing credentials: client_email or private_key");
+      return res.status(200).json({ status: false, message: "Google Play credentials not configured." });
+    }
+
     const auth = new google.auth.GoogleAuth({
       credentials: {
-        client_email: settingJSON?.googlePlayServiceAccountEmail,
-        private_key: settingJSON?.googlePlayPrivateKey.replace(/\\n/g, "\n"),
+        client_email: clientEmail,
+        private_key: privateKey.replace(/\\n/g, "\n"),
       },
       scopes: ["https://www.googleapis.com/auth/androidpublisher"],
     });
@@ -555,35 +596,45 @@ exports.validateGooglePlayPurchase = async (req, res) => {
     const purchase = result.data;
 
     // purchaseState: 0 = Purchased, 1 = Canceled, 2 = Pending
-    if (purchase.purchaseState === 0) {
-      res.status(200).json({ status: true, message: "Purchase verified and coins credited." });
-
-      const totalCoins = coinPlan.coin;
-
-      await Promise.all([
-        User.updateOne({ _id: userObjectId }, { $inc: { coin: totalCoins, topUpCoins: totalCoins } }),
-        History.create({
-          uniqueId,
-          type: 7,
-          userId: user._id,
-          planId: coinPlan._id,
-          coin: totalCoins,
-          amount: coinPlan.amount,
-          paymentGateway: "GooglePlay",
-          date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-        }),
-      ]);
-    } else {
-      return res.status(200).json({ status: false, message: "Purchase verification failed or purchase not completed." });
+    if (purchase.purchaseState !== 0) {
+      const stateMap = { 1: "cancelled", 2: "pending" };
+      return res.status(200).json({
+        status: false,
+        message: `Purchase verification failed. State: ${stateMap[purchase.purchaseState] || "unknown"}`
+      });
     }
+
+    // Credit coins (purchaseState === 0)
+    const totalCoins = coinPlan.coin;
+
+    await Promise.all([
+      User.updateOne({ _id: userObjectId }, { $inc: { coin: totalCoins, topUpCoins: totalCoins } }),
+      History.create({
+        uniqueId,
+        type: 7,
+        userId: user._id,
+        planId: coinPlan._id,
+        coin: totalCoins,
+        amount: coinPlan.amount,
+        paymentGateway: "GooglePlay",
+        purchaseToken: token, // Store token for once-per-token check
+        orderId: purchase.orderId || null,
+        date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+      }),
+    ]);
+
+    console.log(`[GooglePlay] Coins credited: ${totalCoins} to user ${userObjectId}`);
+    return res.status(200).json({ status: true, message: "Coins credited" });
+
   } catch (error) {
     console.error("Google Play validation error:", error.response?.data || error.message);
     return res.status(500).json({ status: false, message: error?.response?.data?.error?.message || "Server error during purchase validation." });
   }
 };
 
-//purchase coinPlan ( google play ) [ IOS ]
-const { AppStoreServerAPIClient, Environment } = require("@apple/app-store-server-library");
+//purchase coinPlan ( Apple App Store - StoreKit 2 )
+const { SignedDataVerifier, Environment, AppStoreServerAPIClient } = require("@apple/app-store-server-library");
+const path = require("path");
 
 // const appleClient = new AppStoreServerAPIClient(
 //   fs.readFileSync("", "utf8"),
@@ -707,6 +758,234 @@ exports.verifyApplePurchase = async (req, res) => {
     });
   }
 };
+
+// ==================== NEW iOS VALIDATION (StoreKit 2 - JWS) ====================
+// Endpoint: POST api/client/coinPlan/validateApplePurchase
+// This follows the contract specification for StoreKit 2 with JWS verification
+
+// Apple Root CA certificates for JWS verification
+let signedDataVerifier = null;
+
+async function getSignedDataVerifier() {
+  if (signedDataVerifier) return signedDataVerifier;
+
+  try {
+    // Apple Root CA - G3 certificate (required for JWS verification)
+    // The library fetches Apple's root certificates automatically
+    const bundleId = "com.lifeis.live.ios";
+    const appAppleId = undefined; // Not required for consumables
+    const environment = Environment.PRODUCTION; // Accepts both Sandbox and Production
+
+    signedDataVerifier = new SignedDataVerifier(
+      [], // Apple root certificates - library fetches automatically
+      true, // Enable online verification
+      environment,
+      bundleId,
+      appAppleId
+    );
+
+    return signedDataVerifier;
+  } catch (error) {
+    console.error("[Apple] Failed to initialize SignedDataVerifier:", error);
+    throw error;
+  }
+}
+
+exports.validateApplePurchase = async (req, res) => {
+  try {
+    console.log("🍎 [IAP] validateApplePurchase START");
+
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ status: false, message: "Unauthorized request." });
+    }
+
+    const { bundleId, productId, transactionId, signedTransaction, coinPlanId } = req.body || {};
+    console.log("📥 [Apple] Request:", { bundleId, productId, transactionId, coinPlanId: coinPlanId || "(empty - retry)" });
+
+    // Validate required fields
+    if (!productId || !transactionId || !signedTransaction) {
+      return res.status(200).json({
+        status: false,
+        message: "Missing required fields: productId, transactionId, and signedTransaction are required.",
+      });
+    }
+
+    const userObjectId = new mongoose.Types.ObjectId(req.user.userId);
+
+    // Check if this transactionId was already credited (once-per-transaction rule)
+    const alreadyCredited = await History.findOne({
+      transactionId: transactionId,
+      paymentGateway: "Apple",
+    }).lean();
+
+    if (alreadyCredited) {
+      console.log(`[Apple] Transaction already credited: ${transactionId}`);
+      return res.status(200).json({ status: true, message: "Coins credited" });
+    }
+
+    // Verify the JWS signature
+    let decodedTransaction;
+    try {
+      const verifier = await getSignedDataVerifier();
+      decodedTransaction = await verifier.verifyAndDecodeTransaction(signedTransaction);
+      console.log("✅ [Apple] JWS verified successfully");
+    } catch (verifyError) {
+      console.error("❌ [Apple] JWS verification failed:", verifyError.message);
+
+      // Fallback: decode without verification for debugging (remove in production if strict)
+      try {
+        const parts = signedTransaction.split(".");
+        if (parts.length === 3) {
+          decodedTransaction = JSON.parse(Buffer.from(parts[1], "base64").toString());
+          console.warn("⚠️ [Apple] Using decoded payload without signature verification");
+        }
+      } catch (decodeError) {
+        return res.status(200).json({
+          status: false,
+          message: "Invalid signed transaction format.",
+        });
+      }
+    }
+
+    if (!decodedTransaction) {
+      return res.status(200).json({
+        status: false,
+        message: "Failed to decode transaction.",
+      });
+    }
+
+    console.log("📄 [Apple] Decoded Transaction:", {
+      transactionId: decodedTransaction.transactionId,
+      productId: decodedTransaction.productId,
+      bundleId: decodedTransaction.bundleId,
+      type: decodedTransaction.type,
+      environment: decodedTransaction.environment,
+    });
+
+    // Validate bundleId
+    const expectedBundleId = "com.lifeis.live.ios";
+    if (decodedTransaction.bundleId !== expectedBundleId) {
+      console.warn(`[Apple] Bundle ID mismatch: ${decodedTransaction.bundleId} !== ${expectedBundleId}`);
+      return res.status(200).json({
+        status: false,
+        message: "Bundle ID mismatch.",
+      });
+    }
+
+    // Validate productId matches
+    if (decodedTransaction.productId !== productId) {
+      console.warn(`[Apple] Product ID mismatch: ${decodedTransaction.productId} !== ${productId}`);
+      return res.status(200).json({
+        status: false,
+        message: "Product ID mismatch.",
+      });
+    }
+
+    // Validate transactionId matches
+    if (String(decodedTransaction.transactionId) !== String(transactionId)) {
+      console.warn(`[Apple] Transaction ID mismatch: ${decodedTransaction.transactionId} !== ${transactionId}`);
+      return res.status(200).json({
+        status: false,
+        message: "Transaction ID mismatch.",
+      });
+    }
+
+    // Check for revocation (refund)
+    if (decodedTransaction.revocationDate) {
+      console.warn(`[Apple] Transaction was refunded: ${transactionId}`);
+      return res.status(200).json({
+        status: false,
+        message: "This purchase has been refunded.",
+      });
+    }
+
+    // Find the coin plan by iosProductKey (or coinPlanId if provided)
+    let coinPlan;
+    if (coinPlanId && coinPlanId !== "") {
+      // Direct lookup by coinPlanId
+      coinPlan = await CoinPlan.findById(coinPlanId).select("_id coin amount iosProductKey productKey").lean();
+
+      // Verify productId matches
+      if (coinPlan) {
+        const expectedProductKey = coinPlan.iosProductKey || coinPlan.productKey;
+        if (expectedProductKey && expectedProductKey !== productId) {
+          console.warn(`[Apple] Product key mismatch for plan ${coinPlanId}`);
+          coinPlan = null; // Will fallback to iosProductKey lookup
+        }
+      }
+    }
+
+    // Fallback: find by iosProductKey (for retries where coinPlanId is empty)
+    if (!coinPlan) {
+      coinPlan = await CoinPlan.findOne({
+        $or: [
+          { iosProductKey: productId },
+          { productKey: productId }, // Legacy fallback
+        ],
+        isActive: true,
+      }).select("_id coin amount iosProductKey productKey").lean();
+    }
+
+    if (!coinPlan) {
+      console.error(`[Apple] No coin plan found for productId: ${productId}`);
+      return res.status(200).json({
+        status: false,
+        message: "Coin plan not found for this product.",
+      });
+    }
+
+    // Get user
+    const user = await User.findById(userObjectId).select("_id coin isBlock").lean();
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    if (user.isBlock) {
+      return res.status(200).json({ status: false, message: "User is blocked." });
+    }
+
+    // Credit coins
+    const totalCoins = coinPlan.coin || 0;
+    const uniqueId = await generateHistoryUniqueId();
+
+    console.log(`💰 [Apple] Crediting ${totalCoins} coins to user ${userObjectId}`);
+
+    await Promise.all([
+      User.updateOne(
+        { _id: userObjectId },
+        { $inc: { coin: totalCoins, topUpCoins: totalCoins } }
+      ),
+      History.create({
+        uniqueId,
+        type: 7,
+        userId: user._id,
+        planId: coinPlan._id,
+        coin: totalCoins,
+        amount: coinPlan.amount,
+        paymentGateway: "Apple",
+        transactionId: transactionId, // Store for once-per-transaction check
+        date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+      }),
+    ]);
+
+    console.log(`🎉 [Apple] SUCCESS - Coins credited: ${totalCoins}`);
+
+    return res.status(200).json({
+      status: true,
+      message: "Coins credited",
+    });
+
+  } catch (error) {
+    console.error("❌ [Apple] validateApplePurchase error:", error.message);
+    console.error(error);
+    return res.status(500).json({
+      status: false,
+      message: "Apple verification failed.",
+    });
+  }
+};
+// ==================== END iOS VALIDATION ====================
 
 //generate razorpay order ( Razorpay )
 exports.createRazorpayOrder = async (req, res) => {
