@@ -79,7 +79,7 @@ app release.
 | Cache | Redis (node-redis 5) | Only used to cache live-stream lists/countries |
 | Auth | Firebase Admin SDK | Verifies ID tokens, mints custom tokens, sends FCM push |
 | Live media | Agora (`agora-access-token`), Tencent TRTC (`tls-sig-api-v2`), Zego (flags only) | Provider chosen by settings; Tencent rollout is additive |
-| Payments | `stripe`, `razorpay`, `googleapis` (Play), plus `axios` calls for Apple, PayPal, Flutterwave, Paystack, Cashfree | Keys live in the Setting document, not `.env` |
+| Payments | `stripe`, `razorpay`, `googleapis` (Play), `@apple/app-store-server-library` (StoreKit 2 JWS), plus `axios` calls for PayPal, Flutterwave, Paystack, Cashfree | Keys live in the Setting document; Google Play credentials may be overridden by `GOOGLE_PLAY_*` env vars |
 | Email | Resend | Transactional mail from `util/emailService.js` |
 | Uploads | Multer disk storage → `storage/` served at `/storage` | SVGA animations served from `/svga` |
 | Scheduling | `node-cron` | One daily job in `index.js` (expire store items) |
@@ -221,7 +221,7 @@ Every feature router then adds `checkAccess()` (secret key) and, where needed,
   that happens inside the room.
 - Socket rooms: each connected user joins `globalRoom:<userId>` (from the
   handshake query) and is marked online; a live room is keyed by the
-  `LiveStreamer._id`. A host that disconnects gets a 30-second grace period
+  `LiveStreamer._id`. A host that disconnects gets a 120-second grace period
   before the stream is ended (`pendingHostDisconnects` in `socket.js`).
 
 ### Settings
@@ -259,11 +259,35 @@ query. Ids arrive as strings and are converted with
 ### Coin purchase (gold coins in)
 
 1. App calls a gateway-specific endpoint in `controllers/client/coinPlan.controller.js`
-   (e.g. `validateGooglePlayPurchase`, `handlePaymentWithStripe`).
+   (e.g. `validateGooglePlayPurchase`, `validateApplePurchase`, `handlePaymentWithStripe`).
 2. Controller verifies the receipt/signature with the provider.
-3. `User` is updated with `$inc: { coin, topUpCoins }`, a `History` row of
-   type `COIN_PLAN_PURCHASE` (7) is written, and `util/updateWealthLevel.js`
-   promotes the user if a new `WealthLevel.coinThreshold` is crossed.
+3. `User` is updated with `$inc: { coin, topUpCoins }` and a `History` row of
+   type `COIN_PLAN_PURCHASE` (7) is written. The purchase endpoints do **not**
+   call `util/updateWealthLevel.js` today (only `user.controller.js` does), so
+   wealth-level promotion happens on the next profile refresh.
+
+Store purchases (in-app):
+
+- `CoinPlan` carries `androidProductKey` (Google Play product id) and
+  `iosProductKey` (App Store product id); `productKey` is the legacy field and
+  is used as a fallback for both. The admin coin-plan endpoints accept and return
+  all three.
+- `POST /api/client/coinPlan/validateGooglePlayPurchase` checks the
+  `productId` against the plan, verifies the token with the Android Publisher
+  API (`purchaseState === 0`), and is idempotent per `purchaseToken`
+  (`History.purchaseToken`, sparse index): a replayed token answers
+  `status:true, "Coins already credited"` without crediting again. Credentials
+  come from `GOOGLE_PLAY_PRIVATE_KEY` / `GOOGLE_PLAY_CLIENT_EMAIL` env vars
+  first, then `Setting.googlePlayPrivateKey` (object or string) and
+  `Setting.googlePlayServiceAccountEmail`.
+- `POST /api/client/coinPlan/validateApplePurchase` (StoreKit 2) takes
+  `productId`, `transactionId`, `signedTransaction` (JWS) and an optional
+  `coinPlanId`; it verifies the JWS with `SignedDataVerifier`, checks bundle id
+  (hard-coded `com.lifeis.live.ios`), product id, transaction id and
+  revocation, resolves the plan by `coinPlanId` or `iosProductKey`, and is
+  idempotent per `transactionId` (`History.transactionId`, sparse index).
+  `verifyApplePurchase` is the legacy receipt endpoint and is still mounted.
+- `History` rows for store purchases also store `orderId` (Google Play).
 
 ### Gift in a live room (coins move)
 
@@ -334,12 +358,13 @@ by the code:
 | `EMAIL` | for email | `from` address for Resend |
 | `JWT_SECRET` | test routes only | Signs tokens returned by `/api/client/test/*` |
 | `PAYPAL_MODE` | PayPal only | `sandbox` or `live` |
+| `GOOGLE_PLAY_PRIVATE_KEY`, `GOOGLE_PLAY_CLIENT_EMAIL` | optional | Override the Google Play service-account credentials stored in `Setting` |
 | `projectName` | optional | Used in email templates |
 
 `DEPLOYMENT.md` lists a slightly different set of names (`mongoURI`,
 `JWT_SECRET`, `AGORA_*`); the names in the table above are the ones the code
 reads today. Agora and payment keys are **not** env vars — they live in the
-`Setting` document.
+`Setting` document (Google Play is the one exception, see the table).
 
 ### Firebase credentials
 
