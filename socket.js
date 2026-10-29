@@ -68,8 +68,8 @@ const { getPkAvailabilityFor, UNAVAILABLE_MESSAGE } = require("./util/pkAvailabi
 // Key: `host:${userId}`, Value: { timeout, liveHistoryId, liveStreamerId, timestamp }
 const pendingHostDisconnects = new Map();
 
-// Grace period in milliseconds (30 seconds by default)
-const HOST_RECONNECT_GRACE_PERIOD = 30 * 1000;
+// Grace period in milliseconds (120 seconds by default)
+const HOST_RECONNECT_GRACE_PERIOD = 120 * 1000;
 
 // Schedule a pending disconnect for a host
 function schedulePendingHostDisconnect(userId, liveHistoryId, liveStreamerId, cleanupCallback) {

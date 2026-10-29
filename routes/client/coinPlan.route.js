@@ -29,8 +29,11 @@ route.post("/handlePaymentWithStripeWeb", checkAccessWithSecretKey(), CoinPlanCo
 //purchase coinPlan ( google play )
 route.post("/validateGooglePlayPurchase", checkAccessWithSecretKey(), CoinPlanController.validateGooglePlayPurchase);
 
-//purchase coinPlan ( google play ) [ IOS ]
+//purchase coinPlan ( Apple - Legacy )
 route.post("/verifyApplePurchase", checkAccessWithSecretKey(), CoinPlanController.verifyApplePurchase);
+
+//purchase coinPlan ( Apple - StoreKit 2 with JWS verification ) - NEW
+route.post("/validateApplePurchase", checkAccessWithSecretKey(), CoinPlanController.validateApplePurchase);
 
 //generate razorpay order ( Razorpay )
 route.post("/createRazorpayOrder", checkAccessWithSecretKey(), CoinPlanController.createRazorpayOrder);

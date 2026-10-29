@@ -71,6 +71,11 @@ const historySchema = new mongoose.Schema(
 
     paymentGateway: { type: String, default: "" },
 
+    // In-App Purchase tracking (for once-per-token/transaction validation)
+    purchaseToken: { type: String, default: null }, // Google Play purchaseToken
+    transactionId: { type: String, default: null }, // Apple transactionId
+    orderId: { type: String, default: null }, // Google Play orderId
+
     planId: { type: mongoose.Schema.Types.ObjectId, ref: "CoinPlan", default: null }, //for type 7
 
     baseType: { type: Number, default: 0 }, //for agency
@@ -90,5 +95,7 @@ historySchema.index({ userId: 1 });
 historySchema.index({ otherUserId: 1 });
 historySchema.index({ giftId: 1 });
 historySchema.index({ createdAt: -1 });
+historySchema.index({ purchaseToken: 1 }, { sparse: true }); // For Google Play once-per-token
+historySchema.index({ transactionId: 1 }, { sparse: true }); // For Apple once-per-transaction
 
 module.exports = mongoose.model("History", historySchema);
