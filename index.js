@@ -111,6 +111,15 @@ async function startServer() {
 
   require("./socket");
 
+  //PK battle: repair sessions left over from a restart, then keep the overdue-round sweep running
+  try {
+    const pkSession = require("./util/pkSession");
+    await pkSession.reconcileOnStartup();
+    pkSession.startSweep();
+  } catch (error) {
+    console.error("PK session reconcile failed:", error);
+  }
+
   app.get("/.well-known/assetlinks.json", (req, res) => {
     res.setHeader("Content-Type", "application/json");
     return res.status(200).json(global?.settingJSON?.androidAssetLinks || []);

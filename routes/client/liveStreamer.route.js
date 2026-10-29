@@ -31,6 +31,12 @@ route.get("/fetchLiveStreamers", validateUserToken, checkAccessWithSecretKey(), 
 //get available users to send pk request ( pk battle )
 route.get("/getAvailableLiveUsers", validateUserToken, checkAccessWithSecretKey(), LiveStreamerController.getAvailableLiveUsers);
 
+//search a host by uniqueId with pk availability ( pk battle )
+route.get("/searchPkHost", validateUserToken, checkAccessWithSecretKey(), LiveStreamerController.searchPkHost);
+
+//recent pk opponents for a one-tap rematch ( pk battle )
+route.get("/recentPkOpponents", validateUserToken, checkAccessWithSecretKey(), LiveStreamerController.recentPkOpponents);
+
 //get available users to invite user ( audio live )
 route.get("/getAvailableUsersForInvite", validateUserToken, checkAccessWithSecretKey(), LiveStreamerController.getAvailableUsersForInvite);
 

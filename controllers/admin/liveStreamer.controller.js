@@ -13,6 +13,7 @@ const moment = require("moment");
 const redis = require("../../util/redis");
 const admin = require("../../util/privateKey");
 const { deleteFile } = require("../../util/deletefile");
+const { endPkSession } = require("../../util/pkSession");
 
 //ends an active live session from admin
 async function performAdminEndLiveSession({ userId, liveHistoryId, liveUserObjId, endLiveStreamPayload = {} }) {
@@ -50,167 +51,14 @@ async function performAdminEndLiveSession({ userId, liveHistoryId, liveUserObjId
     ...endLiveStreamPayload,
   };
 
-  if (liveUser?.isPkMode && liveUser?.pkConfig && ioRef) {
-    // const host1Room = pk.host1ObjId?.toString();
-    // const host2Room = pk.host2ObjId?.toString();
-
+  if (liveUser?.isPkMode && liveUser?.pkId) {
     console.log("[adminEndLive] PK active - ending due to admin end live");
 
-    let winnerHost1 = 0;
-    let winnerHost2 = 0;
-
-    if (liveUser.pkConfig.localRank > liveUser.pkConfig.remoteRank) {
-      winnerHost1 = 2;
-      winnerHost2 = 1;
-    } else if (liveUser.pkConfig.localRank < liveUser.pkConfig.remoteRank) {
-      winnerHost1 = 1;
-      winnerHost2 = 2;
-    }
-
-    await Promise.all([
-      LiveStreamer.findOneAndUpdate({ _id: liveUser._id, isAudio: false }, { "pkConfig.isWinner": winnerHost1 }, { new: true, lean: true }),
-      LiveStreamer.findOneAndUpdate({ userId: liveUser.pkConfig.host2Id, isAudio: false }, { "pkConfig.isWinner": winnerHost2 }, { new: true, lean: true }),
-    ]);
-
-    const [responseForUser1, responseForUser2] = await Promise.all([
-      LiveStreamer.aggregate([
-        {
-          $match: {
-            userId: new mongoose.Types.ObjectId(liveUser.pkConfig.host2Id),
-            isAudio: false,
-          },
-        },
-        {
-          $project: {
-            _id: 1,
-            userId: 1,
-            name: 1,
-            userName: 1,
-            image: 1,
-            token: 1,
-            channel: 1,
-            duration: 1,
-            isPkMode: 1,
-            pkConfig: 1,
-            liveHistoryId: 1,
-            view: 1,
-          },
-        },
-      ]),
-      LiveStreamer.aggregate([
-        {
-          $match: {
-            userId: new mongoose.Types.ObjectId(liveUser.pkConfig.host1Id), //same as liveUser._id
-            isAudio: false,
-          },
-        },
-        {
-          $project: {
-            _id: 1,
-            userId: 1,
-            name: 1,
-            userName: 1,
-            image: 1,
-            token: 1,
-            channel: 1,
-            duration: 1,
-            isPkMode: 1,
-            pkConfig: 1,
-            liveHistoryId: 1,
-            view: 1,
-          },
-        },
-      ]),
-    ]);
-
-    io.in(liveUser.pkConfig.host1ObjId).emit("pkEnd", {
-      isManualMode: true,
-      pkEndUserId: liveUser?.userId,
-      data: responseForUser2[0],
-      winner: responseForUser2[0]?.pkConfig.isWinner == 2 ? responseForUser2[0]?.pkConfig.host1Details : responseForUser2[0]?.pkConfig.host2Details,
+    await endPkSession(liveUser.pkId, {
+      reason: "admin",
+      endedBy: "admin",
+      legacyPkEnd: { isManualMode: true, pkEndUserId: liveUser.userId },
     });
-
-    io.in(liveUser.pkConfig.host2ObjId).emit("pkEnd", {
-      isManualMode: true,
-      pkEndUserId: liveUser?.userId,
-      data: responseForUser1[0],
-      winner: responseForUser1[0]?.pkConfig.isWinner == 2 ? responseForUser1[0]?.pkConfig.host1Details : responseForUser1[0]?.pkConfig.host2Details,
-    });
-
-    if (ioRef) {
-      ioRef.in(roomId).emit("endLiveStream", streamPayload);
-    }
-
-    if (ioRef) {
-      const sockets = await ioRef.in(roomId).fetchSockets();
-      if (sockets.length) {
-        ioRef.socketsLeave(roomId);
-      }
-    }
-
-    await Promise.all([
-      LiveStreamer.updateMany(
-        { pkId: liveUser.pkId },
-        {
-          $set: {
-            isPkMode: false,
-            pkId: null,
-            pkEndTime: null,
-            "pkConfig.host1Id": null,
-            "pkConfig.host1Name": "",
-            "pkConfig.host1Image": "",
-            "pkConfig.host1UniqueId": "",
-            "pkConfig.host1LiveId": "",
-            "pkConfig.host1Channel": "",
-            "pkConfig.host1AgoraUID": 0,
-
-            "pkConfig.host2Id": null,
-            "pkConfig.host2Name": "",
-            "pkConfig.host2userName": "",
-            "pkConfig.host2Image": "",
-            "pkConfig.host2UniqueId": "",
-            "pkConfig.host2LiveId": "",
-            "pkConfig.host2Channel": "",
-            "pkConfig.host2AgoraUID": 0,
-
-            "pkConfig.localRank": 0,
-            "pkConfig.localGiftCount": 0,
-            "pkConfig.remoteRank": 0,
-            "pkConfig.remoteGiftCount": 0,
-            "pkConfig.isWinner": 0,
-
-            "pkConfig.host1Details.userId": null,
-            "pkConfig.host1Details.name": "",
-            "pkConfig.host1Details.userName": "",
-            "pkConfig.host1Details.image": "",
-            "pkConfig.host1Details.isProfilePicBanned": false,
-            "pkConfig.host1Details.isVerified": false,
-            "pkConfig.host1Details.gender": "",
-            "pkConfig.host1Details.age": 0,
-            "pkConfig.host1Details.countryFlagImage": "",
-            "pkConfig.host1Details.country": "",
-            "pkConfig.host1Details.uniqueId": "",
-            "pkConfig.host1Details.coin": 0,
-
-            "pkConfig.host2Details.userId": null,
-            "pkConfig.host2Details.name": "",
-            "pkConfig.host2Details.userName": "",
-            "pkConfig.host2Details.image": "",
-            "pkConfig.host1Details.isProfilePicBanned": false,
-            "pkConfig.host1Details.isVerified": false,
-            "pkConfig.host2Details.gender": "",
-            "pkConfig.host2Details.age": 0,
-            "pkConfig.host2Details.countryFlagImage": "",
-            "pkConfig.host2Details.country": "",
-            "pkConfig.host2Details.uniqueId": "",
-            "pkConfig.host2Details.coin": 0,
-          },
-        },
-        { new: true },
-      ),
-      TopGifter.deleteMany({ liveHistoryId: liveUser.pkConfig.host1LiveId }),
-      TopGifter.deleteMany({ liveHistoryId: liveUser.pkConfig.host2LiveId }),
-    ]);
   }
 
   if (!liveUser.isAudio) {
